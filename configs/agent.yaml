@@ -1,0 +1,46 @@
+agent:
+  id: "web-app-01"  # Auto-generated if empty
+  name: "Web Application"
+  group: "production"
+  tags:
+    - "web"
+    - "production"
+    - "eu-west"
+  heartbeat_interval: "30s"
+  reconnect_delay: "5s"
+  max_retries: 10
+
+control_server:
+  url: "wss://tunnel-control.example.com"
+  token: "agent-secret-token-change-me"
+  insecure_tls: false
+  timeout: "30s"
+
+services:
+  - port: 3000
+    protocol: "http"
+    name: "web-api"
+    description: "Main web API service"
+    internal: true
+    
+  - port: 5432
+    protocol: "tcp"
+    name: "postgres"
+    description: "PostgreSQL database"
+    internal: true
+    
+  - port: 6379
+    protocol: "tcp"
+    name: "redis"
+    description: "Redis cache"
+    internal: true
+
+monitoring:
+  enabled: true
+  metrics_port: 9090
+  collect_interval: "15s"
+
+logging:
+  level: "info"
+  format: "json"
+  output: "/var/log/tunnel-agent.log"

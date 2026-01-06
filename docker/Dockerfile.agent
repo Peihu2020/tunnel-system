@@ -1,0 +1,46 @@
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /build
+
+# Install dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy go mod files
+COPY agent/go.mod agent/go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY agent/ ./
+
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o tunnel-agent ./cmd/agent
+
+# Final stage
+FROM alpine:3.18
+
+# Create non-root user
+RUN addgroup -S tunnel && adduser -S tunnel -G tunnel
+
+# Install required tools
+RUN apk add --no-cache ca-certificates curl
+
+WORKDIR /app
+
+# Copy binaries and configs
+COPY --from=builder /build/tunnel-agent /app/
+COPY configs/agent.yaml /app/configs/
+COPY certs/ /app/certs/
+
+# Set permissions
+RUN chown -R tunnel:tunnel /app && \
+    chmod 755 /app/tunnel-agent && \
+    chmod 600 /app/certs/*.key
+
+USER tunnel
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD /app/tunnel-agent --check || exit 1
+
+ENTRYPOINT ["/app/tunnel-agent"]

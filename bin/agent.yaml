@@ -1,0 +1,31 @@
+agent:
+  id: "user-ThinkCentre-M720q-94fdbf1a"
+  name: "user-ThinkCentre-M720q"
+  group: "production"
+  tags:
+    - "vm"
+    - "production"
+  heartbeat_interval: "30s"
+  reconnect_delay: "5s"
+  max_retries: 10
+
+control_server:
+  url: "wss://20.2.211.73:8443"
+  token: "68e0413c40de871ff7807652a537175c52271e967637162872091d456e6a8d3dabc"
+  insecure_tls: true
+  timeout: "30s"
+
+services:
+  - port: 8083
+    protocol: "http"
+    name: "phpbb-http"
+    internal: true
+  - port: 3000
+    protocol: "http"
+    name: "grafana-http"
+    internal: true
+
+logging:
+  level: "info"
+  format: "json"
+  output: "/opt/tunnel-agent/logs/agent.log"
