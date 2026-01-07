@@ -37,10 +37,9 @@ type Client struct {
 type Tunnel struct {
 	ID         string
 	TargetPort int
-	LocalConn  net.Conn
 	Closed     bool
 	mu         sync.RWMutex
-	forwarding bool // 标记是否正在转发数据
+	// 不再维护持久连接，为每个请求创建新连接
 }
 
 func NewClient(cfg *config.Config, logger *zap.Logger) *Client {
@@ -176,14 +175,10 @@ func (c *Client) disconnect() {
 		c.wsConn = nil
 	}
 
-	for _, tunnel := range c.tunnels {
-		tunnel.mu.Lock()
-		if tunnel.LocalConn != nil {
-			tunnel.LocalConn.Close()
-		}
-		tunnel.mu.Unlock()
+	// 清理所有隧道
+	for tunnelID := range c.tunnels {
+		delete(c.tunnels, tunnelID)
 	}
-	c.tunnels = make(map[string]*Tunnel)
 
 	c.logger.Info("Disconnected from control server")
 }
@@ -321,7 +316,7 @@ func (c *Client) handleTextMessage(data []byte) {
 	}
 }
 
-// 关键修复：处理隧道数据，保持隧道打开
+// 关键修复：处理隧道数据，为每个请求创建独立的连接
 func (c *Client) handleTunnelData(msg models.Message) {
 	var dataPacket models.DataPacket
 	payload, _ := json.Marshal(msg.Payload)
@@ -330,11 +325,19 @@ func (c *Client) handleTunnelData(msg models.Message) {
 		return
 	}
 
-	c.logger.Info("Received tunnel data",
+	c.logger.Info("Processing tunnel data",
 		zap.String("tunnel_id", dataPacket.TunnelID),
 		zap.String("msg_id", msg.ID),
 		zap.Int("data_size", len(dataPacket.Data)),
 		zap.Bool("is_closing", dataPacket.IsClosing))
+
+	// 对于浏览器兼容性：忽略关闭消息
+	if dataPacket.IsClosing {
+		c.logger.Debug("Ignoring close message for browser compatibility",
+			zap.String("tunnel_id", dataPacket.TunnelID),
+			zap.String("msg_id", msg.ID))
+		return
+	}
 
 	// 查找隧道
 	c.mu.RLock()
@@ -344,8 +347,7 @@ func (c *Client) handleTunnelData(msg models.Message) {
 	if !exists {
 		c.logger.Warn("Received data for unknown tunnel",
 			zap.String("tunnel_id", dataPacket.TunnelID),
-			zap.String("msg_id", msg.ID),
-			zap.Any("existing_tunnels", c.getTunnelIDs()))
+			zap.String("msg_id", msg.ID))
 		return
 	}
 
@@ -360,73 +362,242 @@ func (c *Client) handleTunnelData(msg models.Message) {
 		return
 	}
 
-	if dataPacket.IsClosing {
-		// 关键修复：只关闭当前连接，不删除隧道
-		c.logger.Info("Closing tunnel connection",
-			zap.String("tunnel_id", dataPacket.TunnelID))
+	// 为每个请求创建独立的goroutine处理
+	go c.processRequest(tunnel, dataPacket, msg.ID)
+}
 
-		tunnel.mu.Lock()
-		if tunnel.LocalConn != nil {
-			tunnel.LocalConn.Close()
-			tunnel.LocalConn = nil
-			tunnel.forwarding = false
-		}
-		tunnel.mu.Unlock()
+// 处理单个HTTP请求
+func (c *Client) processRequest(tunnel *Tunnel, dataPacket models.DataPacket, msgID string) {
+	// 生成唯一的请求ID用于日志跟踪
+	requestID := fmt.Sprintf("%s-%d", msgID, time.Now().UnixNano())
 
-		// 不删除隧道，保持隧道打开以接收后续请求
+	c.logger.Info("Processing request",
+		zap.String("tunnel_id", tunnel.ID),
+		zap.String("request_id", requestID),
+		zap.Int("request_size", len(dataPacket.Data)))
+
+	// 连接到本地服务
+	localAddr := fmt.Sprintf("127.0.0.1:%d", tunnel.TargetPort)
+	conn, err := net.DialTimeout("tcp", localAddr, 10*time.Second)
+	if err != nil {
+		c.logger.Error("Failed to connect to local service",
+			zap.String("tunnel_id", tunnel.ID),
+			zap.String("request_id", requestID),
+			zap.Error(err))
 		return
 	}
 
-	// 如果本地连接不存在或已关闭，创建新连接
-	tunnel.mu.RLock()
-	localConn := tunnel.LocalConn
-	forwarding := tunnel.forwarding
-	tunnel.mu.RUnlock()
+	defer func() {
+		conn.Close()
+		c.logger.Debug("Local connection closed",
+			zap.String("tunnel_id", tunnel.ID),
+			zap.String("request_id", requestID))
+	}()
 
-	if localConn == nil || isConnectionClosed(localConn) {
-		// 创建到本地服务的新连接
-		conn, err := c.connectToLocalService(dataPacket.TunnelID, tunnel.TargetPort)
+	c.logger.Debug("Connected to local service",
+		zap.String("tunnel_id", tunnel.ID),
+		zap.String("request_id", requestID),
+		zap.String("local_addr", localAddr))
+
+	// 设置连接超时
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	// 发送请求数据
+	if len(dataPacket.Data) > 0 {
+		startTime := time.Now()
+		n, err := conn.Write(dataPacket.Data)
+		writeDuration := time.Since(startTime)
+
 		if err != nil {
-			c.logger.Error("Failed to connect to local service",
-				zap.String("tunnel_id", dataPacket.TunnelID),
+			c.logger.Error("Failed to write request to local service",
+				zap.String("tunnel_id", tunnel.ID),
+				zap.String("request_id", requestID),
 				zap.Error(err))
 			return
 		}
 
-		tunnel.mu.Lock()
-		tunnel.LocalConn = conn
-		tunnel.mu.Unlock()
-
-		// 如果没有正在转发，启动转发goroutine
-		if !forwarding {
-			go c.forwardLocalToWebSocket(tunnel)
-		}
-
-		localConn = conn
+		c.logger.Debug("Request sent to local service",
+			zap.String("tunnel_id", tunnel.ID),
+			zap.String("request_id", requestID),
+			zap.Int("bytes", n),
+			zap.Duration("duration", writeDuration))
 	}
 
-	// 写入数据到本地连接
-	if len(dataPacket.Data) > 0 {
-		n, err := localConn.Write(dataPacket.Data)
-		if err != nil {
-			c.logger.Error("Failed to write to local connection",
-				zap.String("tunnel_id", dataPacket.TunnelID),
+	// 读取响应
+	response, err := c.readResponse(conn, tunnel.ID, requestID)
+	if err != nil {
+		c.logger.Error("Failed to read response from local service",
+			zap.String("tunnel_id", tunnel.ID),
+			zap.String("request_id", requestID),
+			zap.Error(err))
+		return
+	}
+
+	// 发送响应到控制服务器
+	if len(response) > 0 {
+		responsePacket := models.DataPacket{
+			TunnelID: tunnel.ID,
+			Data:     response,
+		}
+
+		responseMsg := models.Message{
+			Type:    models.MsgTypeData,
+			ID:      msgID,
+			Payload: responsePacket,
+		}
+
+		startTime := time.Now()
+		if err := c.sendMessage(responseMsg); err != nil {
+			c.logger.Error("Failed to send response to server",
+				zap.String("tunnel_id", tunnel.ID),
+				zap.String("request_id", requestID),
 				zap.Error(err))
+			return
+		}
 
-			// 关闭连接，但保持隧道打开
-			tunnel.mu.Lock()
-			if tunnel.LocalConn != nil {
-				tunnel.LocalConn.Close()
-				tunnel.LocalConn = nil
-				tunnel.forwarding = false
+		sendDuration := time.Since(startTime)
+		c.logger.Info("Response sent successfully",
+			zap.String("tunnel_id", tunnel.ID),
+			zap.String("request_id", requestID),
+			zap.Int("response_bytes", len(response)),
+			zap.Duration("duration", sendDuration))
+	}
+}
+
+// 读取HTTP响应
+func (c *Client) readResponse(conn net.Conn, tunnelID, requestID string) ([]byte, error) {
+	buffer := make([]byte, 64*1024) // 64KB buffer
+	var response []byte
+	totalRead := 0
+	readTimeout := 30 * time.Second
+
+	for {
+		// 设置读取超时
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
+
+		n, err := conn.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				// 响应结束
+				if totalRead > 0 {
+					response = append(response, buffer[:n]...)
+					totalRead += n
+				}
+				break
 			}
-			tunnel.mu.Unlock()
-		} else {
-			c.logger.Debug("Successfully wrote to local connection",
-				zap.String("tunnel_id", dataPacket.TunnelID),
-				zap.Int("bytes_written", n))
+
+			if isTimeout(err) {
+				c.logger.Warn("Read timeout, ending response",
+					zap.String("tunnel_id", tunnelID),
+					zap.String("request_id", requestID))
+				if n > 0 {
+					response = append(response, buffer[:n]...)
+					totalRead += n
+				}
+				break
+			}
+
+			// 其他错误
+			return nil, fmt.Errorf("read error: %w", err)
+		}
+
+		if n > 0 {
+			response = append(response, buffer[:n]...)
+			totalRead += n
+
+			// 检查是否已读取完整响应
+			if c.isCompleteResponse(response) {
+				c.logger.Debug("Complete HTTP response detected",
+					zap.String("tunnel_id", tunnelID),
+					zap.String("request_id", requestID),
+					zap.Int("bytes", totalRead))
+				break
+			}
+
+			// 检查buffer是否快满了
+			if totalRead > len(buffer)-4096 {
+				c.logger.Warn("Response buffer nearly full, stopping read",
+					zap.String("tunnel_id", tunnelID),
+					zap.String("request_id", requestID),
+					zap.Int("total_bytes", totalRead))
+				break
+			}
 		}
 	}
+
+	c.logger.Debug("Response reading completed",
+		zap.String("tunnel_id", tunnelID),
+		zap.String("request_id", requestID),
+		zap.Int("total_bytes", totalRead))
+
+	return response, nil
+}
+
+// 检查是否为完整的HTTP响应
+func (c *Client) isCompleteResponse(data []byte) bool {
+	if len(data) < 14 { // 最小响应: "HTTP/1.1 200\r\n\r\n"
+		return false
+	}
+
+	// 查找头部结束标记
+	dataStr := string(data)
+
+	// 检查是否有 \r\n\r\n 或 \n\n
+	headerEnd1 := strings.Index(dataStr, "\r\n\r\n")
+	headerEnd2 := strings.Index(dataStr, "\n\n")
+
+	if headerEnd1 == -1 && headerEnd2 == -1 {
+		return false
+	}
+
+	// 检查是否有Content-Length头部
+	if strings.Contains(dataStr, "Content-Length:") {
+		// 需要解析Content-Length并检查body是否完整
+		lines := strings.Split(dataStr, "\r\n")
+		if len(lines) == 1 {
+			lines = strings.Split(dataStr, "\n")
+		}
+
+		var contentLength int
+		for _, line := range lines {
+			if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &contentLength)
+					break
+				}
+			}
+		}
+
+		if contentLength > 0 {
+			// 找到头部结束位置
+			headerEnd := headerEnd1
+			if headerEnd == -1 {
+				headerEnd = headerEnd2
+			} else if headerEnd2 != -1 && headerEnd2 < headerEnd {
+				headerEnd = headerEnd2
+			}
+
+			if headerEnd == -1 {
+				return false
+			}
+
+			// 计算body开始位置
+			bodyStart := headerEnd
+			if strings.HasPrefix(dataStr[headerEnd:], "\r\n\r\n") {
+				bodyStart += 4
+			} else if strings.HasPrefix(dataStr[headerEnd:], "\n\n") {
+				bodyStart += 2
+			}
+
+			// 检查body长度
+			bodyLength := len(data) - bodyStart
+			return bodyLength >= contentLength
+		}
+	}
+
+	// 对于chunked编码或其他情况，认为头部结束就是响应结束
+	return true
 }
 
 func (c *Client) handleTunnelRequest(msg models.Message) {
@@ -486,7 +657,6 @@ func (c *Client) createTunnel(tunnelID string, targetPort int) {
 		ID:         tunnelID,
 		TargetPort: targetPort,
 		Closed:     false,
-		forwarding: false,
 	}
 
 	// 存储隧道
@@ -497,114 +667,6 @@ func (c *Client) createTunnel(tunnelID string, targetPort int) {
 	c.logger.Info("Tunnel created successfully",
 		zap.String("tunnel_id", tunnelID),
 		zap.Int("total_tunnels", len(c.tunnels)))
-}
-
-func (c *Client) connectToLocalService(tunnelID string, targetPort int) (net.Conn, error) {
-	localAddr := fmt.Sprintf("127.0.0.1:%d", targetPort)
-
-	c.logger.Info("Connecting to local service",
-		zap.String("tunnel_id", tunnelID),
-		zap.String("local_addr", localAddr))
-
-	conn, err := net.DialTimeout("tcp", localAddr, 10*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to local service: %w", err)
-	}
-
-	return conn, nil
-}
-
-// 关键修复：修改forwardLocalToWebSocket以处理连接重用
-func (c *Client) forwardLocalToWebSocket(tunnel *Tunnel) {
-	tunnelID := tunnel.ID
-
-	// 标记开始转发
-	tunnel.mu.Lock()
-	tunnel.forwarding = true
-	tunnel.mu.Unlock()
-
-	defer func() {
-		// 标记转发结束
-		tunnel.mu.Lock()
-		tunnel.forwarding = false
-		tunnel.mu.Unlock()
-
-		c.logger.Info("Forwarding stopped",
-			zap.String("tunnel_id", tunnelID))
-	}()
-
-	tunnel.mu.RLock()
-	conn := tunnel.LocalConn
-	tunnel.mu.RUnlock()
-
-	if conn == nil {
-		c.logger.Warn("No local connection for forwarding",
-			zap.String("tunnel_id", tunnelID))
-		return
-	}
-
-	c.logger.Info("=== forwardLocalToWebSocket START ===",
-		zap.String("tunnel_id", tunnelID))
-
-	buffer := make([]byte, 32*1024)
-	totalBytes := 0
-
-	for {
-		// 定期检查隧道状态
-		tunnel.mu.RLock()
-		forwarding := tunnel.forwarding
-		localConn := tunnel.LocalConn
-		tunnel.mu.RUnlock()
-
-		if !forwarding || localConn == nil || localConn != conn {
-			c.logger.Info("Forwarding stopped by tunnel state change",
-				zap.String("tunnel_id", tunnelID))
-			break
-		}
-
-		n, err := conn.Read(buffer)
-		if err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-				c.logger.Error("Local connection read error",
-					zap.String("tunnel_id", tunnelID),
-					zap.Error(err))
-			}
-			break
-		}
-
-		if n == 0 {
-			continue
-		}
-
-		totalBytes += n
-		c.logger.Debug("Read from local service",
-			zap.String("tunnel_id", tunnelID),
-			zap.Int("bytes", n),
-			zap.Int("total_bytes", totalBytes))
-
-		// 创建数据包
-		dataPacket := models.DataPacket{
-			TunnelID: tunnelID,
-			Data:     buffer[:n],
-		}
-
-		msg := models.Message{
-			Type:    models.MsgTypeData,
-			Payload: dataPacket,
-		}
-
-		// 发送到服务器
-		if err := c.sendMessage(msg); err != nil {
-			c.logger.Error("Failed to send data to server",
-				zap.String("tunnel_id", tunnelID),
-				zap.Error(err))
-			break
-		}
-	}
-
-	c.logger.Info("=== forwardLocalToWebSocket END ===",
-		zap.String("tunnel_id", tunnelID),
-		zap.Int("total_bytes", totalBytes))
 }
 
 func (c *Client) handlePing() {
@@ -676,47 +738,6 @@ func (c *Client) isConnected() bool {
 	return c.connected && c.wsConn != nil
 }
 
-// 修改closeTunnel，只有在真正需要时才删除隧道
-func (c *Client) closeTunnel(tunnelID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if tunnel, exists := c.tunnels[tunnelID]; exists {
-		tunnel.mu.Lock()
-		if tunnel.LocalConn != nil {
-			tunnel.LocalConn.Close()
-			tunnel.LocalConn = nil
-		}
-		tunnel.Closed = true
-		tunnel.forwarding = false
-		tunnel.mu.Unlock()
-
-		// 关键：不立即删除隧道，让它自然清理
-		// 我们将在后续的清理过程中删除它
-		c.logger.Info("Tunnel marked as closed",
-			zap.String("tunnel_id", tunnelID))
-	}
-}
-
-// 添加清理已关闭隧道的函数
-func (c *Client) cleanupClosedTunnels() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for tunnelID, tunnel := range c.tunnels {
-		tunnel.mu.RLock()
-		closed := tunnel.Closed
-		tunnel.mu.RUnlock()
-
-		if closed {
-			// 检查隧道是否已经空闲一段时间
-			delete(c.tunnels, tunnelID)
-			c.logger.Debug("Removed closed tunnel",
-				zap.String("tunnel_id", tunnelID))
-		}
-	}
-}
-
 func (c *Client) Disconnect() {
 	c.logger.Info("=== Disconnecting client ===")
 	c.cancel()
@@ -759,34 +780,6 @@ func isTimeout(err error) bool {
 	}
 
 	return false
-}
-
-// 检查连接是否已关闭
-func isConnectionClosed(conn net.Conn) bool {
-	if conn == nil {
-		return true
-	}
-
-	// 尝试读取一个字节来检查连接状态
-	conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-	var buf [1]byte
-	_, err := conn.Read(buf[:])
-	if err != nil {
-		return true
-	}
-	return false
-}
-
-// 辅助函数：获取所有隧道ID
-func (c *Client) getTunnelIDs() []string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	ids := make([]string, 0, len(c.tunnels))
-	for id := range c.tunnels {
-		ids = append(ids, id)
-	}
-	return ids
 }
 
 // Utility functions

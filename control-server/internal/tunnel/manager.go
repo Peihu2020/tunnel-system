@@ -70,8 +70,8 @@ func NewTunnelManager(reg registry.ServiceRegistry, logger *zap.Logger, config *
 	return &TunnelManager{
 		registry:      reg,
 		connections:   make(map[string]*websocket.Conn),
-		tunnels:       make(map[string]*Tunnel),      // 存储原始隧道
-		listeners:     make(map[string]net.Listener), // 存储监听器
+		tunnels:       make(map[string]*Tunnel),
+		listeners:     make(map[string]net.Listener),
 		logger:        logger,
 		config:        config,
 		activeProxies: make(map[string]*http.Server),
@@ -147,6 +147,11 @@ func (tm *TunnelManager) handleMessage(serviceID string, data []byte) {
 		return
 	}
 
+	tm.logger.Debug("Message received",
+		zap.String("type", msg.Type),
+		zap.String("id", msg.ID),
+		zap.String("service_id", serviceID))
+
 	switch msg.Type {
 	case models.MsgTypeRegister:
 		tm.handleRegistration(serviceID, msg)
@@ -220,7 +225,7 @@ func (tm *TunnelManager) handleHeartbeat(serviceID string, msg models.Message) {
 	}
 }
 
-// 关键修复：当处理来自Agent的关闭消息时，只关闭当前连接
+// 关键修复：处理从Agent返回的数据
 func (tm *TunnelManager) handleData(serviceID string, msg models.Message) {
 	var dataPacket models.DataPacket
 	payload, _ := json.Marshal(msg.Payload)
@@ -231,21 +236,37 @@ func (tm *TunnelManager) handleData(serviceID string, msg models.Message) {
 		return
 	}
 
-	tm.logger.Info("Processing data from agent",
+	tm.logger.Debug("Processing data from agent",
 		zap.String("service_id", serviceID),
 		zap.String("tunnel_id", dataPacket.TunnelID),
 		zap.String("msg_id", msg.ID),
 		zap.Int("data_size", len(dataPacket.Data)),
 		zap.Bool("is_closing", dataPacket.IsClosing))
 
-	// 查找所有相关的连接隧道
+	// 对于浏览器兼容性：忽略关闭消息
+	if dataPacket.IsClosing {
+		tm.logger.Debug("Ignoring close message for browser compatibility",
+			zap.String("tunnel_id", dataPacket.TunnelID),
+			zap.String("service_id", serviceID))
+		return
+	}
+
+	// 查找对应的连接隧道
 	tm.mu.RLock()
 	var targetTunnel *Tunnel
-	for tunnelID, tunnel := range tm.tunnels {
-		// 查找连接隧道
-		if strings.HasPrefix(tunnelID, dataPacket.TunnelID+"-conn-") && tunnel.ServiceID == serviceID {
-			// 使用msg.ID来匹配特定的连接隧道
-			if msg.ID == "" || msg.ID == tunnelID {
+
+	// 首先尝试使用msg.ID查找连接隧道
+	if msg.ID != "" {
+		if tunnel, exists := tm.tunnels[msg.ID]; exists && tunnel.ServiceID == serviceID {
+			targetTunnel = tunnel
+		}
+	}
+
+	// 如果没找到，查找所有以原始隧道ID开头的连接隧道
+	if targetTunnel == nil {
+		for tunnelID, tunnel := range tm.tunnels {
+			if strings.HasPrefix(tunnelID, dataPacket.TunnelID+"-conn-") &&
+				tunnel.ServiceID == serviceID {
 				targetTunnel = tunnel
 				break
 			}
@@ -261,53 +282,68 @@ func (tm *TunnelManager) handleData(serviceID string, msg models.Message) {
 		return
 	}
 
-	if dataPacket.IsClosing {
-		// 关键修复：只关闭这个连接隧道，不关闭原始隧道
-		tm.logger.Info("Closing connection tunnel",
-			zap.String("connection_tunnel_id", targetTunnel.ID),
-			zap.String("original_tunnel_id", dataPacket.TunnelID))
-
-		targetTunnel.mu.Lock()
-		if targetTunnel.conn != nil {
-			targetTunnel.conn.Close()
-			targetTunnel.conn = nil
-		}
-		targetTunnel.mu.Unlock()
-
-		// 删除这个连接隧道，但原始隧道保持打开
-		tm.mu.Lock()
-		delete(tm.tunnels, targetTunnel.ID)
-		tm.mu.Unlock()
-
-		return
-	}
-
-	// 处理数据
+	// 写入数据到客户端连接
 	targetTunnel.mu.RLock()
 	conn := targetTunnel.conn
 	targetTunnel.mu.RUnlock()
 
 	if conn == nil {
-		tm.logger.Error("Connection tunnel connection is nil",
+		tm.logger.Error("Tunnel connection is nil",
 			zap.String("tunnel_id", targetTunnel.ID))
 		return
 	}
 
 	if len(dataPacket.Data) > 0 {
+		startTime := time.Now()
 		n, err := conn.Write(dataPacket.Data)
+		writeDuration := time.Since(startTime)
+
 		if err != nil {
 			tm.logger.Error("Failed to write data to client",
 				zap.String("tunnel_id", targetTunnel.ID),
-				zap.Error(err))
+				zap.Error(err),
+				zap.Duration("duration", writeDuration))
 
 			// 关闭这个连接隧道
 			tm.closeTunnelInternal(targetTunnel.ID)
 		} else {
 			tm.logger.Debug("Successfully wrote data to client",
 				zap.String("tunnel_id", targetTunnel.ID),
-				zap.Int("bytes", n))
+				zap.Int("bytes", n),
+				zap.Duration("duration", writeDuration))
+
+			// 检查是否为完整响应，如果是，可以关闭连接
+			if tm.isCompleteResponse(dataPacket.Data) {
+				tm.logger.Debug("Complete response sent, closing connection tunnel",
+					zap.String("tunnel_id", targetTunnel.ID))
+				tm.closeTunnelInternal(targetTunnel.ID)
+			}
 		}
 	}
+}
+
+// 检查是否为完整的HTTP响应
+func (tm *TunnelManager) isCompleteResponse(data []byte) bool {
+	if len(data) < 14 {
+		return false
+	}
+
+	dataStr := string(data)
+
+	// 检查是否有头部结束标记
+	headerEnd1 := strings.Index(dataStr, "\r\n\r\n")
+	headerEnd2 := strings.Index(dataStr, "\n\n")
+
+	if headerEnd1 == -1 && headerEnd2 == -1 {
+		return false
+	}
+
+	// 如果是HTTP响应，检查状态码
+	if strings.HasPrefix(dataStr, "HTTP/") {
+		return true
+	}
+
+	return false
 }
 
 func (tm *TunnelManager) handleTunnelResponse(serviceID string, msg models.Message) {
@@ -356,7 +392,7 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 		zap.String("tunnel_id", tunnelID),
 		zap.String("local_addr", localAddr))
 
-	// 创建原始隧道对象（不包含连接）
+	// 创建原始隧道对象
 	tunnel := &Tunnel{
 		ID:        tunnelID,
 		ServiceID: serviceID,
@@ -406,7 +442,6 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 	return localAddr, nil
 }
 
-// 修复：acceptTunnelConnections 现在为每个连接创建独立的隧道
 func (tm *TunnelManager) acceptTunnelConnections(tunnelID string, listener net.Listener, serviceID string, targetPort int) {
 	tm.logger.Info("Starting tunnel listener",
 		zap.String("tunnel_id", tunnelID),
@@ -463,16 +498,11 @@ func (tm *TunnelManager) acceptTunnelConnections(tunnelID string, listener net.L
 	}
 }
 
+// 完整修复的handleTunnelConnection（方案B）
 func (tm *TunnelManager) handleTunnelConnection(connectionTunnelID string, conn net.Conn, originalTunnelID string) {
-	defer func() {
-		conn.Close()
-		tm.closeTunnelInternal(connectionTunnelID) // 只关闭连接隧道
-		tm.logger.Info("Connection tunnel closed",
-			zap.String("tunnel_id", connectionTunnelID))
-	}()
-
-	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(5 * time.Minute))
+	tm.logger.Info("Starting tunnel connection handler",
+		zap.String("tunnel_id", connectionTunnelID),
+		zap.String("client_addr", conn.RemoteAddr().String()))
 
 	// 获取隧道信息
 	tm.mu.RLock()
@@ -482,88 +512,148 @@ func (tm *TunnelManager) handleTunnelConnection(connectionTunnelID string, conn 
 
 	if !exists || !serviceExists {
 		tm.logger.Error("Tunnel or service not found",
-			zap.String("tunnel_id", connectionTunnelID),
-			zap.Bool("tunnel_exists", exists),
-			zap.Bool("service_exists", serviceExists))
+			zap.String("tunnel_id", connectionTunnelID))
+		conn.Close()
 		return
 	}
 
-	// 设置wsConn
+	// 设置连接
 	tunnel.mu.Lock()
 	tunnel.wsConn = wsConn
+	tunnel.conn = conn
 	tunnel.mu.Unlock()
 
-	// 启动客户端 -> WebSocket 方向的数据传输
-	done := make(chan bool, 1)
+	// 设置连接超时
+	conn.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	// 启动客户端到Agent的数据转发
+	clientToAgentDone := make(chan bool, 1)
 
 	go func() {
-		buffer := make([]byte, tm.config.BufferSize)
-		totalRead := 0
+		defer func() {
+			clientToAgentDone <- true
+		}()
+
+		buffer := make([]byte, 32*1024)
+		totalSent := 0
 
 		for {
+			// 设置读取超时
+			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
 			n, err := conn.Read(buffer)
 			if err != nil {
-				if err != io.EOF {
+				if err == io.EOF {
+					tm.logger.Info("Client connection closed (EOF)",
+						zap.String("tunnel_id", connectionTunnelID))
+				} else if isTimeout(err) {
+					tm.logger.Debug("Client read timeout, continuing",
+						zap.String("tunnel_id", connectionTunnelID))
+					continue
+				} else {
 					tm.logger.Error("Client read error",
 						zap.String("tunnel_id", connectionTunnelID),
 						zap.Error(err))
-				} else {
-					tm.logger.Info("Client connection EOF",
-						zap.String("tunnel_id", connectionTunnelID))
 				}
 				break
 			}
 
-			if n > 0 {
-				totalRead += n
-				tm.logger.Debug("Read from client",
-					zap.String("connection_tunnel_id", connectionTunnelID),
-					zap.String("original_tunnel_id", originalTunnelID),
-					zap.Int("bytes", n))
+			if n == 0 {
+				continue
+			}
 
-				// 关键：使用原始隧道ID发送数据
-				dataPacket := models.DataPacket{
-					TunnelID: originalTunnelID, // 使用原始隧道ID
-					Data:     buffer[:n],
-				}
+			totalSent += n
+			tm.logger.Debug("Read data from client",
+				zap.String("tunnel_id", connectionTunnelID),
+				zap.Int("bytes", n),
+				zap.Int("total_sent", totalSent))
 
-				msg := models.Message{
-					Type:    models.MsgTypeData,
-					ID:      connectionTunnelID,
-					Payload: dataPacket,
-				}
+			// 发送到Agent
+			dataPacket := models.DataPacket{
+				TunnelID: originalTunnelID,
+				Data:     buffer[:n],
+			}
 
-				// 发送到agent
-				if err := tm.sendMessage(tunnel.ServiceID, msg); err != nil {
-					tm.logger.Error("Failed to forward data to agent",
-						zap.String("connection_tunnel_id", connectionTunnelID),
-						zap.String("original_tunnel_id", originalTunnelID),
-						zap.Error(err))
-					break
-				}
+			msg := models.Message{
+				Type:    models.MsgTypeData,
+				ID:      connectionTunnelID,
+				Payload: dataPacket,
+			}
+
+			if err := tm.sendMessage(tunnel.ServiceID, msg); err != nil {
+				tm.logger.Error("Failed to send data to agent",
+					zap.String("tunnel_id", connectionTunnelID),
+					zap.Error(err))
+				break
 			}
 		}
-
-		done <- true
 	}()
 
-	// 等待连接结束
-	<-done
+	// Agent到客户端的数据转发在handleData中处理
 
-	// 发送关闭消息到agent（可选）
-	dataPacket := models.DataPacket{
-		TunnelID:  originalTunnelID,
-		IsClosing: true,
+	// 等待客户端连接结束
+	<-clientToAgentDone
+
+	// 清理
+	conn.Close()
+	tm.closeTunnelInternal(connectionTunnelID)
+
+	tm.logger.Info("Tunnel connection handler completed",
+		zap.String("tunnel_id", connectionTunnelID),
+		zap.String("client_addr", conn.RemoteAddr().String()))
+}
+
+// 检查是否为完整的HTTP请求
+func (tm *TunnelManager) isCompleteRequest(data []byte) bool {
+	if len(data) < 16 { // 最小请求: "GET / HTTP/1.1\r\n\r\n"
+		return false
 	}
 
-	msg := models.Message{
-		Type:    models.MsgTypeData,
-		ID:      connectionTunnelID,
-		Payload: dataPacket,
+	dataStr := string(data)
+
+	// 检查是否有头部结束标记
+	headerEnd1 := strings.Index(dataStr, "\r\n\r\n")
+	headerEnd2 := strings.Index(dataStr, "\n\n")
+
+	return headerEnd1 != -1 || headerEnd2 != -1
+}
+
+// 检查是否为HTTP请求
+func (tm *TunnelManager) isHTTPRequest(data []byte) bool {
+	str := string(data)
+	return strings.HasPrefix(str, "GET ") ||
+		strings.HasPrefix(str, "POST ") ||
+		strings.HasPrefix(str, "PUT ") ||
+		strings.HasPrefix(str, "DELETE ") ||
+		strings.HasPrefix(str, "HEAD ") ||
+		strings.HasPrefix(str, "OPTIONS ") ||
+		strings.HasPrefix(str, "PATCH ") ||
+		strings.HasPrefix(str, "CONNECT ")
+}
+
+// 处理HTTP请求，添加必要的头部
+func (tm *TunnelManager) processHTTPRequest(data []byte, tunnelID string) []byte {
+	str := string(data)
+
+	// 确保有Host头部
+	if !strings.Contains(str, "\r\nHost: ") && !strings.Contains(str, "\nHost: ") {
+		// 在请求行后添加Host头部
+		lines := strings.SplitN(str, "\r\n", 2)
+		if len(lines) < 2 {
+			lines = strings.SplitN(str, "\n", 2)
+		}
+
+		if len(lines) == 2 {
+			requestLine := lines[0]
+			remaining := lines[1]
+
+			// 添加Host头部
+			modified := requestLine + "\r\nHost: localhost\r\n" + remaining
+			return []byte(modified)
+		}
 	}
 
-	// 尝试发送关闭消息
-	tm.sendMessage(tunnel.ServiceID, msg)
+	return data
 }
 
 func (tm *TunnelManager) closeTunnel(tunnelID string) {
@@ -644,4 +734,24 @@ func (tm *TunnelManager) keepAlive(conn *websocket.Conn, serviceID string) {
 
 func (tm *TunnelManager) validateToken(serviceID, token string) bool {
 	return token != ""
+}
+
+// 辅助函数
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+
+	return false
 }
