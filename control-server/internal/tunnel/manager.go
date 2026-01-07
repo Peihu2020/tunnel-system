@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,13 +28,19 @@ var upgrader = websocket.Upgrader{
 
 type TunnelManager struct {
 	registry      registry.ServiceRegistry
-	connections   map[string]*websocket.Conn // serviceID -> connection
-	tunnels       map[string]*Tunnel         // tunnelID -> tunnel
-	listeners     map[string]net.Listener    // tunnelID -> listener
+	connections   map[string]*ConnectionWrapper // 改为包装器
+	tunnels       map[string]*Tunnel
+	listeners     map[string]net.Listener
 	mu            sync.RWMutex
 	logger        *zap.Logger
 	config        *Config
 	activeProxies map[string]*http.Server
+}
+
+// 包装WebSocket连接，添加写锁
+type ConnectionWrapper struct {
+	conn *websocket.Conn
+	mu   sync.Mutex // 为每个连接添加互斥锁
 }
 
 type Tunnel struct {
@@ -43,7 +50,7 @@ type Tunnel struct {
 	RemoteAddr string
 	CreatedAt  time.Time
 	conn       net.Conn
-	wsConn     *websocket.Conn
+	wsConn     *ConnectionWrapper
 	closed     bool
 	mu         sync.RWMutex
 }
@@ -54,9 +61,14 @@ type Config struct {
 	MaxMessageSize   int64
 	PingInterval     time.Duration
 	PongWait         time.Duration
+	WriteWait        time.Duration
 }
 
 func NewTunnelManager(reg registry.ServiceRegistry, logger *zap.Logger, config *Config) *TunnelManager {
+	if config == nil {
+		config = &Config{}
+	}
+
 	if config.BufferSize < 4096 {
 		logger.Warn("Buffer size too small, increasing to 32KB", zap.Int("original", config.BufferSize))
 		config.BufferSize = 32 * 1024
@@ -67,9 +79,19 @@ func NewTunnelManager(reg registry.ServiceRegistry, logger *zap.Logger, config *
 		config.MaxMessageSize = 10 * 1024 * 1024
 	}
 
+	if config.PingInterval == 0 {
+		config.PingInterval = 25 * time.Second
+	}
+	if config.PongWait == 0 {
+		config.PongWait = 30 * time.Second
+	}
+	if config.WriteWait == 0 {
+		config.WriteWait = 10 * time.Second
+	}
+
 	return &TunnelManager{
 		registry:      reg,
-		connections:   make(map[string]*websocket.Conn),
+		connections:   make(map[string]*ConnectionWrapper),
 		tunnels:       make(map[string]*Tunnel),
 		listeners:     make(map[string]net.Listener),
 		logger:        logger,
@@ -98,10 +120,13 @@ func (tm *TunnelManager) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	defer conn.Close()
+	// 创建包装器
+	wrapper := &ConnectionWrapper{
+		conn: conn,
+	}
 
 	tm.mu.Lock()
-	tm.connections[serviceID] = conn
+	tm.connections[serviceID] = wrapper
 	tm.mu.Unlock()
 
 	defer func() {
@@ -114,6 +139,12 @@ func (tm *TunnelManager) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		tm.mu.Unlock()
+		tm.logger.Info("WebSocket connection closed", zap.String("service_id", serviceID))
+
+		// 关闭WebSocket连接
+		wrapper.mu.Lock()
+		conn.Close()
+		wrapper.mu.Unlock()
 	}()
 
 	conn.SetReadLimit(tm.config.MaxMessageSize)
@@ -123,24 +154,36 @@ func (tm *TunnelManager) HandleWebSocket(w http.ResponseWriter, r *http.Request)
 		return nil
 	})
 
-	go tm.keepAlive(conn, serviceID)
+	go tm.keepAlive(wrapper, serviceID)
+
+	tm.logger.Info("WebSocket connection established",
+		zap.String("service_id", serviceID),
+		zap.String("remote_addr", r.RemoteAddr))
 
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				tm.logger.Error("WebSocket error", zap.Error(err))
+			} else {
+				tm.logger.Debug("WebSocket closed", zap.String("service_id", serviceID))
 			}
 			break
 		}
 
 		if messageType == websocket.TextMessage {
-			tm.handleMessage(serviceID, message)
+			go tm.handleMessage(serviceID, message, wrapper)
+		} else if messageType == websocket.PingMessage {
+			// 响应Ping
+			wrapper.mu.Lock()
+			conn.SetWriteDeadline(time.Now().Add(tm.config.WriteWait))
+			conn.WriteMessage(websocket.PongMessage, nil)
+			wrapper.mu.Unlock()
 		}
 	}
 }
 
-func (tm *TunnelManager) handleMessage(serviceID string, data []byte) {
+func (tm *TunnelManager) handleMessage(serviceID string, data []byte, wrapper *ConnectionWrapper) {
 	var msg models.Message
 	if err := json.Unmarshal(data, &msg); err != nil {
 		tm.logger.Error("Failed to unmarshal message", zap.Error(err))
@@ -154,25 +197,25 @@ func (tm *TunnelManager) handleMessage(serviceID string, data []byte) {
 
 	switch msg.Type {
 	case models.MsgTypeRegister:
-		tm.handleRegistration(serviceID, msg)
+		tm.handleRegistration(serviceID, msg, wrapper)
 	case models.MsgTypeHeartbeat:
 		tm.handleHeartbeat(serviceID, msg)
 	case models.MsgTypeData:
-		tm.handleData(serviceID, msg)
+		tm.handleData(serviceID, msg, wrapper)
 	case models.MsgTypeTunnelResp:
 		tm.handleTunnelResponse(serviceID, msg)
 	case models.MsgTypePong:
-		// Already handled by SetPongHandler
+		tm.logger.Debug("Pong received", zap.String("service_id", serviceID))
 	default:
 		tm.logger.Warn("Unknown message type", zap.String("type", msg.Type))
 	}
 }
 
-func (tm *TunnelManager) handleRegistration(serviceID string, msg models.Message) {
+func (tm *TunnelManager) handleRegistration(serviceID string, msg models.Message, wrapper *ConnectionWrapper) {
 	var regReq models.RegistrationRequest
 	data, _ := json.Marshal(msg.Payload)
 	if err := json.Unmarshal(data, &regReq); err != nil {
-		tm.sendError(serviceID, "invalid registration format")
+		tm.sendError(serviceID, "invalid registration format", wrapper)
 		return
 	}
 
@@ -188,16 +231,8 @@ func (tm *TunnelManager) handleRegistration(serviceID string, msg models.Message
 	}
 
 	if err := tm.registry.Register(service); err != nil {
-		tm.sendError(serviceID, fmt.Sprintf("registration failed: %v", err))
+		tm.sendError(serviceID, fmt.Sprintf("registration failed: %v", err), wrapper)
 		return
-	}
-
-	tm.mu.RLock()
-	conn, exists := tm.connections[serviceID]
-	tm.mu.RUnlock()
-
-	if exists {
-		service.Conn = conn
 	}
 
 	response := models.Message{
@@ -208,7 +243,7 @@ func (tm *TunnelManager) handleRegistration(serviceID string, msg models.Message
 		},
 	}
 
-	if err := tm.sendMessage(serviceID, response); err != nil {
+	if err := tm.sendMessage(serviceID, response, wrapper); err != nil {
 		tm.logger.Error("Failed to send registration ack", zap.Error(err))
 	}
 }
@@ -225,8 +260,7 @@ func (tm *TunnelManager) handleHeartbeat(serviceID string, msg models.Message) {
 	}
 }
 
-// 关键修复：处理从Agent返回的数据
-func (tm *TunnelManager) handleData(serviceID string, msg models.Message) {
+func (tm *TunnelManager) handleData(serviceID string, msg models.Message, wrapper *ConnectionWrapper) {
 	var dataPacket models.DataPacket
 	payload, _ := json.Marshal(msg.Payload)
 	if err := json.Unmarshal(payload, &dataPacket); err != nil {
@@ -314,9 +348,8 @@ func (tm *TunnelManager) handleData(serviceID string, msg models.Message) {
 
 			// 检查是否为完整响应，如果是，可以关闭连接
 			if tm.isCompleteResponse(dataPacket.Data) {
-				tm.logger.Debug("Complete response sent, closing connection tunnel",
+				tm.logger.Debug("Complete response sent",
 					zap.String("tunnel_id", targetTunnel.ID))
-				tm.closeTunnelInternal(targetTunnel.ID)
 			}
 		}
 	}
@@ -360,7 +393,7 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 	tunnelID := fmt.Sprintf("tun-%s-%d-%d", serviceID, targetPort, time.Now().UnixNano())
 
 	tm.mu.RLock()
-	conn, exists := tm.connections[serviceID]
+	wrapper, exists := tm.connections[serviceID]
 	tm.mu.RUnlock()
 
 	if !exists {
@@ -368,7 +401,10 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 	}
 
 	// 验证连接是否存活
-	if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second)); err != nil {
+	wrapper.mu.Lock()
+	err := wrapper.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+	wrapper.mu.Unlock()
+	if err != nil {
 		tm.logger.Warn("WebSocket connection dead, cleaning up",
 			zap.String("service_id", serviceID),
 			zap.Error(err))
@@ -398,6 +434,7 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 		ServiceID: serviceID,
 		LocalAddr: localAddr,
 		CreatedAt: time.Now(),
+		wsConn:    wrapper,
 	}
 
 	// 存储原始隧道
@@ -417,7 +454,7 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 		},
 	}
 
-	if err := tm.sendMessage(serviceID, tunnelReq); err != nil {
+	if err := tm.sendMessage(serviceID, tunnelReq, wrapper); err != nil {
 		tm.logger.Error("Failed to send tunnel request",
 			zap.String("tunnel_id", tunnelID),
 			zap.String("service_id", serviceID),
@@ -433,7 +470,7 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 	}
 
 	// 开始接受连接
-	go tm.acceptTunnelConnections(tunnelID, listener, serviceID, targetPort)
+	go tm.acceptTunnelConnections(tunnelID, listener, serviceID, targetPort, wrapper)
 
 	tm.logger.Info("Tunnel creation completed",
 		zap.String("tunnel_id", tunnelID),
@@ -442,7 +479,7 @@ func (tm *TunnelManager) CreateTunnel(serviceID string, targetPort int) (string,
 	return localAddr, nil
 }
 
-func (tm *TunnelManager) acceptTunnelConnections(tunnelID string, listener net.Listener, serviceID string, targetPort int) {
+func (tm *TunnelManager) acceptTunnelConnections(tunnelID string, listener net.Listener, serviceID string, targetPort int, wrapper *ConnectionWrapper) {
 	tm.logger.Info("Starting tunnel listener",
 		zap.String("tunnel_id", tunnelID),
 		zap.String("listen_addr", listener.Addr().String()))
@@ -484,7 +521,7 @@ func (tm *TunnelManager) acceptTunnelConnections(tunnelID string, listener net.L
 			ServiceID: serviceID,
 			LocalAddr: listener.Addr().String(),
 			CreatedAt: time.Now(),
-			wsConn:    nil,
+			wsConn:    wrapper,
 			conn:      conn,
 		}
 
@@ -494,12 +531,12 @@ func (tm *TunnelManager) acceptTunnelConnections(tunnelID string, listener net.L
 		tm.mu.Unlock()
 
 		// 启动协程处理这个连接
-		go tm.handleTunnelConnection(connectionTunnelID, conn, tunnelID)
+		go tm.handleTunnelConnection(connectionTunnelID, conn, tunnelID, wrapper)
 	}
 }
 
-// 完整修复的handleTunnelConnection（方案B）
-func (tm *TunnelManager) handleTunnelConnection(connectionTunnelID string, conn net.Conn, originalTunnelID string) {
+// 修复后的handleTunnelConnection，使用带锁的连接包装器
+func (tm *TunnelManager) handleTunnelConnection(connectionTunnelID string, conn net.Conn, originalTunnelID string, wrapper *ConnectionWrapper) {
 	tm.logger.Info("Starting tunnel connection handler",
 		zap.String("tunnel_id", connectionTunnelID),
 		zap.String("client_addr", conn.RemoteAddr().String()))
@@ -507,11 +544,10 @@ func (tm *TunnelManager) handleTunnelConnection(connectionTunnelID string, conn 
 	// 获取隧道信息
 	tm.mu.RLock()
 	tunnel, exists := tm.tunnels[connectionTunnelID]
-	wsConn, serviceExists := tm.connections[tunnel.ServiceID]
 	tm.mu.RUnlock()
 
-	if !exists || !serviceExists {
-		tm.logger.Error("Tunnel or service not found",
+	if !exists {
+		tm.logger.Error("Tunnel not found",
 			zap.String("tunnel_id", connectionTunnelID))
 		conn.Close()
 		return
@@ -519,80 +555,116 @@ func (tm *TunnelManager) handleTunnelConnection(connectionTunnelID string, conn 
 
 	// 设置连接
 	tunnel.mu.Lock()
-	tunnel.wsConn = wsConn
 	tunnel.conn = conn
 	tunnel.mu.Unlock()
 
-	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(5 * time.Minute))
+	// 使用context控制goroutine生命周期
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 设置合理的超时
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	// 启动客户端到Agent的数据转发
-	clientToAgentDone := make(chan bool, 1)
+	clientToAgentDone := make(chan struct{})
+	errorChan := make(chan error, 1)
 
 	go func() {
 		defer func() {
-			clientToAgentDone <- true
+			close(clientToAgentDone)
+			cancel()
 		}()
 
 		buffer := make([]byte, 32*1024)
 		totalSent := 0
 
 		for {
-			// 设置读取超时
-			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				// 设置读取超时
+				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-			n, err := conn.Read(buffer)
-			if err != nil {
-				if err == io.EOF {
-					tm.logger.Info("Client connection closed (EOF)",
-						zap.String("tunnel_id", connectionTunnelID))
-				} else if isTimeout(err) {
-					tm.logger.Debug("Client read timeout, continuing",
-						zap.String("tunnel_id", connectionTunnelID))
+				n, err := conn.Read(buffer)
+				if err != nil {
+					if err == io.EOF {
+						tm.logger.Debug("Client connection closed (EOF)",
+							zap.String("tunnel_id", connectionTunnelID))
+						return
+					} else if isTimeout(err) {
+						// 超时，检查连接是否仍然存活
+						if tm.isConnectionClosed(conn) {
+							tm.logger.Debug("Client connection appears closed",
+								zap.String("tunnel_id", connectionTunnelID))
+							return
+						}
+						// 连接仍然存活，继续等待
+						continue
+					} else if strings.Contains(err.Error(), "use of closed network connection") ||
+						strings.Contains(err.Error(), "connection reset by peer") {
+						// 客户端主动关闭连接，这是正常行为
+						tm.logger.Debug("Client closed connection",
+							zap.String("tunnel_id", connectionTunnelID))
+						return
+					} else {
+						tm.logger.Warn("Client read error",
+							zap.String("tunnel_id", connectionTunnelID),
+							zap.Error(err))
+						errorChan <- err
+						return
+					}
+				}
+
+				if n == 0 {
 					continue
-				} else {
-					tm.logger.Error("Client read error",
+				}
+
+				totalSent += n
+				tm.logger.Debug("Read data from client",
+					zap.String("tunnel_id", connectionTunnelID),
+					zap.Int("bytes", n),
+					zap.Int("total_sent", totalSent))
+
+				// 发送到Agent（使用带锁的连接）
+				dataPacket := models.DataPacket{
+					TunnelID: originalTunnelID,
+					Data:     buffer[:n],
+				}
+
+				msg := models.Message{
+					Type:    models.MsgTypeData,
+					ID:      connectionTunnelID,
+					Payload: dataPacket,
+				}
+
+				if err := tm.sendMessage(tunnel.ServiceID, msg, wrapper); err != nil {
+					tm.logger.Error("Failed to send data to agent",
 						zap.String("tunnel_id", connectionTunnelID),
 						zap.Error(err))
+					errorChan <- err
+					return
 				}
-				break
-			}
 
-			if n == 0 {
-				continue
-			}
-
-			totalSent += n
-			tm.logger.Debug("Read data from client",
-				zap.String("tunnel_id", connectionTunnelID),
-				zap.Int("bytes", n),
-				zap.Int("total_sent", totalSent))
-
-			// 发送到Agent
-			dataPacket := models.DataPacket{
-				TunnelID: originalTunnelID,
-				Data:     buffer[:n],
-			}
-
-			msg := models.Message{
-				Type:    models.MsgTypeData,
-				ID:      connectionTunnelID,
-				Payload: dataPacket,
-			}
-
-			if err := tm.sendMessage(tunnel.ServiceID, msg); err != nil {
-				tm.logger.Error("Failed to send data to agent",
-					zap.String("tunnel_id", connectionTunnelID),
-					zap.Error(err))
-				break
+				// 每次成功读取后重置超时
+				conn.SetDeadline(time.Now().Add(60 * time.Second))
 			}
 		}
 	}()
 
-	// Agent到客户端的数据转发在handleData中处理
-
-	// 等待客户端连接结束
-	<-clientToAgentDone
+	// 等待处理完成或超时
+	select {
+	case <-clientToAgentDone:
+		tm.logger.Debug("Client to agent transfer completed normally",
+			zap.String("tunnel_id", connectionTunnelID))
+	case err := <-errorChan:
+		tm.logger.Warn("Error in tunnel connection",
+			zap.String("tunnel_id", connectionTunnelID),
+			zap.Error(err))
+	case <-time.After(60 * time.Second):
+		tm.logger.Warn("Tunnel connection timeout",
+			zap.String("tunnel_id", connectionTunnelID))
+	}
 
 	// 清理
 	conn.Close()
@@ -603,61 +675,12 @@ func (tm *TunnelManager) handleTunnelConnection(connectionTunnelID string, conn 
 		zap.String("client_addr", conn.RemoteAddr().String()))
 }
 
-// 检查是否为完整的HTTP请求
-func (tm *TunnelManager) isCompleteRequest(data []byte) bool {
-	if len(data) < 16 { // 最小请求: "GET / HTTP/1.1\r\n\r\n"
-		return false
-	}
-
-	dataStr := string(data)
-
-	// 检查是否有头部结束标记
-	headerEnd1 := strings.Index(dataStr, "\r\n\r\n")
-	headerEnd2 := strings.Index(dataStr, "\n\n")
-
-	return headerEnd1 != -1 || headerEnd2 != -1
-}
-
-// 检查是否为HTTP请求
-func (tm *TunnelManager) isHTTPRequest(data []byte) bool {
-	str := string(data)
-	return strings.HasPrefix(str, "GET ") ||
-		strings.HasPrefix(str, "POST ") ||
-		strings.HasPrefix(str, "PUT ") ||
-		strings.HasPrefix(str, "DELETE ") ||
-		strings.HasPrefix(str, "HEAD ") ||
-		strings.HasPrefix(str, "OPTIONS ") ||
-		strings.HasPrefix(str, "PATCH ") ||
-		strings.HasPrefix(str, "CONNECT ")
-}
-
-// 处理HTTP请求，添加必要的头部
-func (tm *TunnelManager) processHTTPRequest(data []byte, tunnelID string) []byte {
-	str := string(data)
-
-	// 确保有Host头部
-	if !strings.Contains(str, "\r\nHost: ") && !strings.Contains(str, "\nHost: ") {
-		// 在请求行后添加Host头部
-		lines := strings.SplitN(str, "\r\n", 2)
-		if len(lines) < 2 {
-			lines = strings.SplitN(str, "\n", 2)
-		}
-
-		if len(lines) == 2 {
-			requestLine := lines[0]
-			remaining := lines[1]
-
-			// 添加Host头部
-			modified := requestLine + "\r\nHost: localhost\r\n" + remaining
-			return []byte(modified)
-		}
-	}
-
-	return data
-}
-
-func (tm *TunnelManager) closeTunnel(tunnelID string) {
-	tm.closeTunnelInternal(tunnelID)
+// 添加连接状态检查函数
+func (tm *TunnelManager) isConnectionClosed(conn net.Conn) bool {
+	// 尝试写一个字节来检查连接状态
+	conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+	_, err := conn.Write([]byte{})
+	return err != nil
 }
 
 func (tm *TunnelManager) closeTunnelInternal(tunnelID string) {
@@ -690,13 +713,16 @@ func (tm *TunnelManager) closeTunnelInternal(tunnelID string) {
 	}
 }
 
-func (tm *TunnelManager) sendMessage(serviceID string, msg models.Message) error {
-	tm.mu.RLock()
-	conn, exists := tm.connections[serviceID]
-	tm.mu.RUnlock()
+// 修改sendMessage，使用带锁的连接
+func (tm *TunnelManager) sendMessage(serviceID string, msg models.Message, wrapper *ConnectionWrapper) error {
+	if wrapper == nil {
+		tm.mu.RLock()
+		_, exists := tm.connections[serviceID]
+		tm.mu.RUnlock()
 
-	if !exists {
-		return fmt.Errorf("service %s not connected", serviceID)
+		if !exists {
+			return fmt.Errorf("service %s not connected", serviceID)
+		}
 	}
 
 	data, err := json.Marshal(msg)
@@ -704,35 +730,46 @@ func (tm *TunnelManager) sendMessage(serviceID string, msg models.Message) error
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return conn.WriteMessage(websocket.TextMessage, data)
+	// 使用连接锁确保线程安全
+	wrapper.mu.Lock()
+	defer wrapper.mu.Unlock()
+
+	wrapper.conn.SetWriteDeadline(time.Now().Add(tm.config.WriteWait))
+	return wrapper.conn.WriteMessage(websocket.TextMessage, data)
 }
 
-func (tm *TunnelManager) sendError(serviceID, errorMsg string) {
+func (tm *TunnelManager) sendError(serviceID, errorMsg string, wrapper *ConnectionWrapper) {
 	msg := models.Message{
 		Type:  models.MsgTypeError,
 		Error: errorMsg,
 	}
-	tm.sendMessage(serviceID, msg)
+	tm.sendMessage(serviceID, msg, wrapper)
 }
 
-func (tm *TunnelManager) keepAlive(conn *websocket.Conn, serviceID string) {
+func (tm *TunnelManager) keepAlive(wrapper *ConnectionWrapper, serviceID string) {
 	ticker := time.NewTicker(tm.config.PingInterval)
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-			tm.logger.Warn("Ping failed",
-				zap.String("service_id", serviceID),
-				zap.Error(err))
-			return
+		select {
+		case <-ticker.C:
+			wrapper.mu.Lock()
+			wrapper.conn.SetWriteDeadline(time.Now().Add(tm.config.WriteWait))
+			err := wrapper.conn.WriteMessage(websocket.PingMessage, nil)
+			wrapper.mu.Unlock()
+
+			if err != nil {
+				tm.logger.Debug("Ping failed, connection may be closed",
+					zap.String("service_id", serviceID),
+					zap.Error(err))
+				return
+			}
 		}
 	}
 }
 
 func (tm *TunnelManager) validateToken(serviceID, token string) bool {
+	// 实际实现应该验证token有效性
 	return token != ""
 }
 

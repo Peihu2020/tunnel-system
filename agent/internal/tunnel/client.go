@@ -152,7 +152,8 @@ func (c *Client) connect() error {
 
 	conn.SetReadLimit(64 * 1024 * 1024)
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// 延长Pong响应时间
+		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		return nil
 	})
 
@@ -166,9 +167,13 @@ func (c *Client) disconnect() {
 	c.connected = false
 
 	if c.wsConn != nil {
-		c.wsConn.WriteControl(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		// 优雅关闭WebSocket
+		err := c.wsConn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "client shutdown"),
 			time.Now().Add(5*time.Second))
+		if err != nil {
+			c.logger.Debug("Error sending close message", zap.Error(err))
+		}
 
 		time.Sleep(100 * time.Millisecond)
 		c.wsConn.Close()
@@ -193,6 +198,9 @@ func (c *Client) reconnect() {
 		c.logger.Info("Attempting reconnect...")
 		if err := c.Connect(); err != nil {
 			c.logger.Error("Reconnect failed", zap.Error(err))
+			// 指数退避重试
+			time.Sleep(5 * time.Second)
+			c.reconnect()
 		} else {
 			c.logger.Info("Reconnect successful")
 		}
@@ -251,10 +259,24 @@ func (c *Client) handleMessages() {
 			return
 		}
 
-		c.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// 设置较长的读取超时
+		c.wsConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 		messageType, data, err := c.wsConn.ReadMessage()
 		if err != nil {
+			// 检查是否为读取超时
+			if err.Error() == "i/o timeout" {
+				c.logger.Debug("WebSocket read timeout, sending ping...")
+				// 发送Ping检查连接
+				if err := c.wsConn.WriteControl(websocket.PingMessage,
+					[]byte{}, time.Now().Add(5*time.Second)); err != nil {
+					c.logger.Error("Ping failed, reconnecting", zap.Error(err))
+					c.reconnect()
+					return
+				}
+				continue
+			}
+
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				c.logger.Info("WebSocket closed normally by server")
 				c.disconnect()
@@ -267,11 +289,6 @@ func (c *Client) handleMessages() {
 				return
 			}
 
-			if isTimeout(err) {
-				c.logger.Debug("WebSocket read timeout, continuing...")
-				continue
-			}
-
 			c.logger.Error("handleMessages: ReadMessage failed", zap.Error(err))
 			c.reconnect()
 			return
@@ -282,7 +299,10 @@ func (c *Client) handleMessages() {
 			zap.Int("data_length", len(data)))
 
 		if messageType == websocket.TextMessage {
-			c.handleTextMessage(data)
+			go c.handleTextMessage(data)
+		} else if messageType == websocket.PongMessage {
+			// 重置读取超时
+			c.wsConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		}
 	}
 }
@@ -679,20 +699,37 @@ func (c *Client) handlePing() {
 func (c *Client) heartbeat() {
 	c.logger.Info("=== heartbeat STARTED ===")
 
-	ticker := time.NewTicker(c.config.Agent.HeartbeatInterval)
-	defer ticker.Stop()
+	pingTicker := time.NewTicker(25 * time.Second)
+	heartbeatTicker := time.NewTicker(30 * time.Second)
+	defer pingTicker.Stop()
+	defer heartbeatTicker.Stop()
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			c.logger.Info("=== heartbeat STOPPED (context cancelled) ===")
 			return
-		case <-ticker.C:
+		case <-pingTicker.C:
 			if !c.isConnected() {
 				c.logger.Warn("heartbeat: not connected, stopping")
 				return
 			}
 
+			// 发送WebSocket Ping
+			c.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := c.wsConn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				c.logger.Error("Failed to send ping", zap.Error(err))
+				c.reconnect()
+				return
+			}
+
+		case <-heartbeatTicker.C:
+			if !c.isConnected() {
+				c.logger.Warn("heartbeat: not connected, stopping")
+				return
+			}
+
+			// 发送应用层心跳
 			hb := models.Heartbeat{
 				ServiceID:   c.config.Agent.ID,
 				Timestamp:   time.Now(),
@@ -707,8 +744,7 @@ func (c *Client) heartbeat() {
 
 			if err := c.sendMessage(msg); err != nil {
 				c.logger.Error("Failed to send heartbeat", zap.Error(err))
-				c.reconnect()
-				return
+				// 不立即重连，让Ping/Pong机制处理
 			}
 		}
 	}
@@ -759,6 +795,7 @@ func isNetError(err error) bool {
 		"network is unreachable",
 		"i/o timeout",
 		"websocket: close",
+		"EOF",
 	}
 
 	for _, netErr := range netErrors {
@@ -813,9 +850,11 @@ func getOSInfo() string {
 }
 
 func getCPUUsage() float64 {
+	// 实现CPU使用率获取
 	return 0.0
 }
 
 func getMemoryUsage() float64 {
+	// 实现内存使用率获取
 	return 0.0
 }

@@ -43,10 +43,12 @@ type RegistrationRequest struct {
 }
 
 type Heartbeat struct {
-	ServiceID   string    `json:"service_id"`
-	Timestamp   time.Time `json:"timestamp"`
-	CPUUsage    float64   `json:"cpu_usage,omitempty"`
-	MemoryUsage float64   `json:"memory_usage,omitempty"`
+	ServiceID       string                 `json:"service_id"`
+	Timestamp       time.Time              `json:"timestamp"`
+	CPUUsage        float64                `json:"cpu_usage,omitempty"`
+	MemoryUsage     float64                `json:"memory_usage,omitempty"`
+	ConnectionCount int                    `json:"connection_count,omitempty"` // 添加这个字段
+	Stats           map[string]interface{} `json:"stats,omitempty"`            // 添加这个字段
 }
 
 type DataPacket struct {
