@@ -39,6 +39,8 @@ type Tunnel struct {
 	TargetPort int
 	LocalConn  net.Conn
 	Closed     bool
+	mu         sync.RWMutex
+	forwarding bool // 标记是否正在转发数据
 }
 
 func NewClient(cfg *config.Config, logger *zap.Logger) *Client {
@@ -55,7 +57,6 @@ func NewClient(cfg *config.Config, logger *zap.Logger) *Client {
 }
 
 func (c *Client) Connect() error {
-	// 先检查连接状态
 	if c.isConnected() {
 		c.logger.Info("Already connected, skipping reconnect")
 		return nil
@@ -70,8 +71,7 @@ func (c *Client) Connect() error {
 		}
 
 		c.logger.Info("Attempting to connect to control server",
-			zap.Int("attempt", retries+1),
-			zap.Int("max_attempts", maxRetries))
+			zap.Int("attempt", retries+1))
 
 		if err := c.connect(); err != nil {
 			c.lastError = err
@@ -79,8 +79,7 @@ func (c *Client) Connect() error {
 
 			c.logger.Error("Connection failed",
 				zap.Error(err),
-				zap.Int("retry", retries),
-				zap.Duration("delay", c.config.Agent.ReconnectDelay))
+				zap.Int("retry", retries))
 
 			select {
 			case <-c.ctx.Done():
@@ -90,19 +89,15 @@ func (c *Client) Connect() error {
 			}
 		}
 
-		// 连接成功
 		c.logger.Info("Connection established successfully")
 
-		// 立即注册
 		if err := c.register(); err != nil {
-			c.logger.Error("Registration failed, reconnecting",
-				zap.Error(err))
+			c.logger.Error("Registration failed, reconnecting", zap.Error(err))
 			c.disconnect()
 			retries++
 			continue
 		}
 
-		// 启动消息处理（带panic恢复）
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -115,179 +110,13 @@ func (c *Client) Connect() error {
 			c.handleMessages()
 		}()
 
-		// 启动心跳
 		go c.heartbeat()
 
 		return nil
 	}
 }
 
-func (c *Client) disconnect() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.connected = false
-
-	if c.wsConn != nil {
-		// 优雅关闭
-		c.wsConn.WriteControl(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-			time.Now().Add(5*time.Second))
-
-		time.Sleep(100 * time.Millisecond)
-
-		c.wsConn.Close()
-		c.wsConn = nil
-	}
-
-	c.logger.Info("Disconnected from control server")
-}
-
-func (c *Client) reconnect() {
-	c.logger.Warn("=== RECONNECTING ===")
-
-	c.disconnect()
-
-	// 等待一小段时间
-	time.Sleep(1 * time.Second)
-
-	// Close all tunnels
-	c.mu.Lock()
-	for _, tunnel := range c.tunnels {
-		if tunnel.LocalConn != nil {
-			tunnel.LocalConn.Close()
-		}
-	}
-	c.tunnels = make(map[string]*Tunnel)
-	c.mu.Unlock()
-
-	// Try to reconnect
-	go func() {
-		c.logger.Info("Attempting reconnect...")
-		if err := c.Connect(); err != nil {
-			c.logger.Error("Reconnect failed", zap.Error(err))
-		} else {
-			c.logger.Info("Reconnect successful")
-		}
-	}()
-}
-
-func (c *Client) handleMessages() {
-	defer func() {
-		if r := recover(); r != nil {
-			c.logger.Error("handleMessages PANIC RECOVERED",
-				zap.Any("panic", r),
-				zap.String("stack", string(debug.Stack())))
-			c.reconnect()
-		}
-	}()
-
-	c.logger.Info("=== handleMessages STARTED ===",
-		zap.String("agent_id", c.config.Agent.ID),
-		zap.Time("start_time", time.Now()))
-
-	defer func() {
-		c.logger.Info("=== handleMessages ENDED ===",
-			zap.String("agent_id", c.config.Agent.ID),
-			zap.Time("end_time", time.Now()))
-	}()
-
-	// 立即检查连接状态
-	if !c.isConnected() {
-		c.logger.Error("handleMessages: not connected at start!",
-			zap.Bool("c.connected", c.connected),
-			zap.Bool("wsConn_exists", c.wsConn != nil))
-		return
-	}
-
-	c.logger.Info("handleMessages: connection verified, starting read loop")
-
-	for {
-		// 每次循环都检查
-		if !c.isConnected() {
-			c.logger.Warn("handleMessages: connection lost during loop")
-			return
-		}
-
-		c.logger.Debug("handleMessages: waiting for message...")
-
-		// 设置读取超时
-		c.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-
-		messageType, data, err := c.wsConn.ReadMessage()
-		if err != nil {
-			// 检查错误类型
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				c.logger.Info("WebSocket closed normally by server")
-				c.disconnect()
-				return
-			}
-
-			// 检查是否是网络错误
-			if isNetError(err) {
-				c.logger.Error("Network error in WebSocket connection",
-					zap.Error(err),
-					zap.String("error_type", fmt.Sprintf("%T", err)))
-				c.reconnect()
-				return
-			}
-
-			// 检查是否是超时
-			if isTimeout(err) {
-				c.logger.Debug("WebSocket read timeout, continuing...")
-				continue
-			}
-
-			// 其他错误
-			c.logger.Error("handleMessages: ReadMessage failed",
-				zap.Error(err),
-				zap.String("error_type", fmt.Sprintf("%T", err)))
-
-			c.reconnect()
-			return
-		}
-
-		c.logger.Info("handleMessages: received message",
-			zap.Int("message_type", messageType),
-			zap.Int("data_length", len(data)))
-
-		if messageType == websocket.TextMessage {
-			c.handleTextMessage(data)
-		} else if messageType == websocket.BinaryMessage {
-			c.handleBinaryMessage(data)
-		}
-	}
-}
-
-// 辅助函数
-func isNetError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	errStr := err.Error()
-	netErrors := []string{
-		"use of closed network connection",
-		"connection reset by peer",
-		"broken pipe",
-		"connection refused",
-		"network is unreachable",
-		"i/o timeout",
-		"websocket: close",
-		"repeated read on failed websocket connection",
-	}
-
-	for _, netErr := range netErrors {
-		if strings.Contains(strings.ToLower(errStr), strings.ToLower(netErr)) {
-			return true
-		}
-	}
-
-	return false
-}
-
 func (c *Client) connect() error {
-	// Prepare WebSocket URL
 	wsURL := fmt.Sprintf("%s/ws?service_id=%s&token=%s",
 		c.config.ControlServer.URL,
 		c.config.Agent.ID,
@@ -295,12 +124,10 @@ func (c *Client) connect() error {
 
 	c.logger.Info("Dialing WebSocket", zap.String("url", wsURL))
 
-	// Configure dialer
 	dialer := websocket.Dialer{
 		HandshakeTimeout: c.config.ControlServer.Timeout,
 	}
 
-	// Configure TLS if needed
 	if c.config.ControlServer.InsecureTLS {
 		dialer.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
@@ -318,17 +145,13 @@ func (c *Client) connect() error {
 
 	c.mu.Lock()
 	c.wsConn = conn
-	c.connected = true // 关键修复：设置connected标志为true
+	c.connected = true
 	c.mu.Unlock()
 
 	c.logger.Info("Connected to control server",
-		zap.String("url", c.config.ControlServer.URL),
-		zap.String("agent_id", c.config.Agent.ID),
-		zap.Bool("connected_flag", true),
-		zap.Int("response_status", resp.StatusCode))
+		zap.String("agent_id", c.config.Agent.ID))
 
-	// 设置合理的WebSocket参数
-	conn.SetReadLimit(64 * 1024 * 1024) // 64MB
+	conn.SetReadLimit(64 * 1024 * 1024)
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
@@ -337,8 +160,51 @@ func (c *Client) connect() error {
 	return nil
 }
 
+func (c *Client) disconnect() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.connected = false
+
+	if c.wsConn != nil {
+		c.wsConn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+			time.Now().Add(5*time.Second))
+
+		time.Sleep(100 * time.Millisecond)
+		c.wsConn.Close()
+		c.wsConn = nil
+	}
+
+	for _, tunnel := range c.tunnels {
+		tunnel.mu.Lock()
+		if tunnel.LocalConn != nil {
+			tunnel.LocalConn.Close()
+		}
+		tunnel.mu.Unlock()
+	}
+	c.tunnels = make(map[string]*Tunnel)
+
+	c.logger.Info("Disconnected from control server")
+}
+
+func (c *Client) reconnect() {
+	c.logger.Warn("=== RECONNECTING ===")
+
+	c.disconnect()
+	time.Sleep(1 * time.Second)
+
+	go func() {
+		c.logger.Info("Attempting reconnect...")
+		if err := c.Connect(); err != nil {
+			c.logger.Error("Reconnect failed", zap.Error(err))
+		} else {
+			c.logger.Info("Reconnect successful")
+		}
+	}()
+}
+
 func (c *Client) register() error {
-	// Build service ports
 	var ports []models.ServicePort
 	for _, svcPort := range c.config.Services {
 		ports = append(ports, models.ServicePort{
@@ -350,7 +216,6 @@ func (c *Client) register() error {
 		})
 	}
 
-	// Prepare registration request
 	regReq := models.RegistrationRequest{
 		ServiceID:   c.config.Agent.ID,
 		ServiceName: c.config.Agent.Name,
@@ -371,6 +236,382 @@ func (c *Client) register() error {
 	}
 
 	return c.sendMessage(msg)
+}
+
+func (c *Client) handleMessages() {
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("handleMessages PANIC RECOVERED",
+				zap.Any("panic", r),
+				zap.String("stack", string(debug.Stack())))
+			c.reconnect()
+		}
+	}()
+
+	c.logger.Info("=== handleMessages STARTED ===")
+
+	for {
+		if !c.isConnected() {
+			c.logger.Warn("handleMessages: connection lost during loop")
+			return
+		}
+
+		c.wsConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+		messageType, data, err := c.wsConn.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				c.logger.Info("WebSocket closed normally by server")
+				c.disconnect()
+				return
+			}
+
+			if isNetError(err) {
+				c.logger.Error("Network error in WebSocket connection", zap.Error(err))
+				c.reconnect()
+				return
+			}
+
+			if isTimeout(err) {
+				c.logger.Debug("WebSocket read timeout, continuing...")
+				continue
+			}
+
+			c.logger.Error("handleMessages: ReadMessage failed", zap.Error(err))
+			c.reconnect()
+			return
+		}
+
+		c.logger.Debug("Message received",
+			zap.Int("message_type", messageType),
+			zap.Int("data_length", len(data)))
+
+		if messageType == websocket.TextMessage {
+			c.handleTextMessage(data)
+		}
+	}
+}
+
+func (c *Client) handleTextMessage(data []byte) {
+	var msg models.Message
+	if err := json.Unmarshal(data, &msg); err != nil {
+		c.logger.Error("Failed to unmarshal message", zap.Error(err))
+		return
+	}
+
+	c.logger.Info("Processing message",
+		zap.String("type", msg.Type),
+		zap.String("id", msg.ID))
+
+	switch msg.Type {
+	case models.MsgTypeTunnelReq:
+		c.handleTunnelRequest(msg)
+	case models.MsgTypeData:
+		c.handleTunnelData(msg)
+	case models.MsgTypePing:
+		c.handlePing()
+	case "registration_ack":
+		c.logger.Info("Registration acknowledged")
+	case "error":
+		c.logger.Error("Received error from server",
+			zap.Any("message", msg.Payload))
+	default:
+		c.logger.Warn("Unknown message type",
+			zap.String("type", msg.Type))
+	}
+}
+
+// 关键修复：处理隧道数据，保持隧道打开
+func (c *Client) handleTunnelData(msg models.Message) {
+	var dataPacket models.DataPacket
+	payload, _ := json.Marshal(msg.Payload)
+	if err := json.Unmarshal(payload, &dataPacket); err != nil {
+		c.logger.Error("Failed to parse data packet", zap.Error(err))
+		return
+	}
+
+	c.logger.Info("Received tunnel data",
+		zap.String("tunnel_id", dataPacket.TunnelID),
+		zap.String("msg_id", msg.ID),
+		zap.Int("data_size", len(dataPacket.Data)),
+		zap.Bool("is_closing", dataPacket.IsClosing))
+
+	// 查找隧道
+	c.mu.RLock()
+	tunnel, exists := c.tunnels[dataPacket.TunnelID]
+	c.mu.RUnlock()
+
+	if !exists {
+		c.logger.Warn("Received data for unknown tunnel",
+			zap.String("tunnel_id", dataPacket.TunnelID),
+			zap.String("msg_id", msg.ID),
+			zap.Any("existing_tunnels", c.getTunnelIDs()))
+		return
+	}
+
+	// 检查隧道是否已关闭
+	tunnel.mu.RLock()
+	closed := tunnel.Closed
+	tunnel.mu.RUnlock()
+
+	if closed {
+		c.logger.Warn("Tunnel is already closed",
+			zap.String("tunnel_id", dataPacket.TunnelID))
+		return
+	}
+
+	if dataPacket.IsClosing {
+		// 关键修复：只关闭当前连接，不删除隧道
+		c.logger.Info("Closing tunnel connection",
+			zap.String("tunnel_id", dataPacket.TunnelID))
+
+		tunnel.mu.Lock()
+		if tunnel.LocalConn != nil {
+			tunnel.LocalConn.Close()
+			tunnel.LocalConn = nil
+			tunnel.forwarding = false
+		}
+		tunnel.mu.Unlock()
+
+		// 不删除隧道，保持隧道打开以接收后续请求
+		return
+	}
+
+	// 如果本地连接不存在或已关闭，创建新连接
+	tunnel.mu.RLock()
+	localConn := tunnel.LocalConn
+	forwarding := tunnel.forwarding
+	tunnel.mu.RUnlock()
+
+	if localConn == nil || isConnectionClosed(localConn) {
+		// 创建到本地服务的新连接
+		conn, err := c.connectToLocalService(dataPacket.TunnelID, tunnel.TargetPort)
+		if err != nil {
+			c.logger.Error("Failed to connect to local service",
+				zap.String("tunnel_id", dataPacket.TunnelID),
+				zap.Error(err))
+			return
+		}
+
+		tunnel.mu.Lock()
+		tunnel.LocalConn = conn
+		tunnel.mu.Unlock()
+
+		// 如果没有正在转发，启动转发goroutine
+		if !forwarding {
+			go c.forwardLocalToWebSocket(tunnel)
+		}
+
+		localConn = conn
+	}
+
+	// 写入数据到本地连接
+	if len(dataPacket.Data) > 0 {
+		n, err := localConn.Write(dataPacket.Data)
+		if err != nil {
+			c.logger.Error("Failed to write to local connection",
+				zap.String("tunnel_id", dataPacket.TunnelID),
+				zap.Error(err))
+
+			// 关闭连接，但保持隧道打开
+			tunnel.mu.Lock()
+			if tunnel.LocalConn != nil {
+				tunnel.LocalConn.Close()
+				tunnel.LocalConn = nil
+				tunnel.forwarding = false
+			}
+			tunnel.mu.Unlock()
+		} else {
+			c.logger.Debug("Successfully wrote to local connection",
+				zap.String("tunnel_id", dataPacket.TunnelID),
+				zap.Int("bytes_written", n))
+		}
+	}
+}
+
+func (c *Client) handleTunnelRequest(msg models.Message) {
+	c.logger.Info("=== handleTunnelRequest ENTER ===")
+
+	payload, _ := json.Marshal(msg.Payload)
+	var tunnelReq struct {
+		TunnelID   string `json:"tunnel_id"`
+		TargetPort int    `json:"target_port"`
+		LocalAddr  string `json:"local_addr"`
+	}
+
+	if err := json.Unmarshal(payload, &tunnelReq); err != nil {
+		c.logger.Error("Invalid tunnel request", zap.Error(err))
+		return
+	}
+
+	c.logger.Info("Received tunnel request",
+		zap.String("tunnel_id", tunnelReq.TunnelID),
+		zap.Int("target_port", tunnelReq.TargetPort))
+
+	// 检查端口是否允许
+	allowed := false
+	for _, port := range c.config.Services {
+		if port.Port == tunnelReq.TargetPort {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		c.logger.Error("Port not allowed", zap.Int("port", tunnelReq.TargetPort))
+		return
+	}
+
+	// 创建隧道（如果不存在）
+	c.createTunnel(tunnelReq.TunnelID, tunnelReq.TargetPort)
+}
+
+func (c *Client) createTunnel(tunnelID string, targetPort int) {
+	c.logger.Info("=== createTunnel START ===",
+		zap.String("tunnel_id", tunnelID),
+		zap.Int("target_port", targetPort))
+
+	// 检查隧道是否已经存在
+	c.mu.RLock()
+	_, exists := c.tunnels[tunnelID]
+	c.mu.RUnlock()
+
+	if exists {
+		c.logger.Info("Tunnel already exists", zap.String("tunnel_id", tunnelID))
+		return
+	}
+
+	// 创建隧道对象
+	tunnel := &Tunnel{
+		ID:         tunnelID,
+		TargetPort: targetPort,
+		Closed:     false,
+		forwarding: false,
+	}
+
+	// 存储隧道
+	c.mu.Lock()
+	c.tunnels[tunnelID] = tunnel
+	c.mu.Unlock()
+
+	c.logger.Info("Tunnel created successfully",
+		zap.String("tunnel_id", tunnelID),
+		zap.Int("total_tunnels", len(c.tunnels)))
+}
+
+func (c *Client) connectToLocalService(tunnelID string, targetPort int) (net.Conn, error) {
+	localAddr := fmt.Sprintf("127.0.0.1:%d", targetPort)
+
+	c.logger.Info("Connecting to local service",
+		zap.String("tunnel_id", tunnelID),
+		zap.String("local_addr", localAddr))
+
+	conn, err := net.DialTimeout("tcp", localAddr, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to local service: %w", err)
+	}
+
+	return conn, nil
+}
+
+// 关键修复：修改forwardLocalToWebSocket以处理连接重用
+func (c *Client) forwardLocalToWebSocket(tunnel *Tunnel) {
+	tunnelID := tunnel.ID
+
+	// 标记开始转发
+	tunnel.mu.Lock()
+	tunnel.forwarding = true
+	tunnel.mu.Unlock()
+
+	defer func() {
+		// 标记转发结束
+		tunnel.mu.Lock()
+		tunnel.forwarding = false
+		tunnel.mu.Unlock()
+
+		c.logger.Info("Forwarding stopped",
+			zap.String("tunnel_id", tunnelID))
+	}()
+
+	tunnel.mu.RLock()
+	conn := tunnel.LocalConn
+	tunnel.mu.RUnlock()
+
+	if conn == nil {
+		c.logger.Warn("No local connection for forwarding",
+			zap.String("tunnel_id", tunnelID))
+		return
+	}
+
+	c.logger.Info("=== forwardLocalToWebSocket START ===",
+		zap.String("tunnel_id", tunnelID))
+
+	buffer := make([]byte, 32*1024)
+	totalBytes := 0
+
+	for {
+		// 定期检查隧道状态
+		tunnel.mu.RLock()
+		forwarding := tunnel.forwarding
+		localConn := tunnel.LocalConn
+		tunnel.mu.RUnlock()
+
+		if !forwarding || localConn == nil || localConn != conn {
+			c.logger.Info("Forwarding stopped by tunnel state change",
+				zap.String("tunnel_id", tunnelID))
+			break
+		}
+
+		n, err := conn.Read(buffer)
+		if err != nil {
+			if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+				c.logger.Error("Local connection read error",
+					zap.String("tunnel_id", tunnelID),
+					zap.Error(err))
+			}
+			break
+		}
+
+		if n == 0 {
+			continue
+		}
+
+		totalBytes += n
+		c.logger.Debug("Read from local service",
+			zap.String("tunnel_id", tunnelID),
+			zap.Int("bytes", n),
+			zap.Int("total_bytes", totalBytes))
+
+		// 创建数据包
+		dataPacket := models.DataPacket{
+			TunnelID: tunnelID,
+			Data:     buffer[:n],
+		}
+
+		msg := models.Message{
+			Type:    models.MsgTypeData,
+			Payload: dataPacket,
+		}
+
+		// 发送到服务器
+		if err := c.sendMessage(msg); err != nil {
+			c.logger.Error("Failed to send data to server",
+				zap.String("tunnel_id", tunnelID),
+				zap.Error(err))
+			break
+		}
+	}
+
+	c.logger.Info("=== forwardLocalToWebSocket END ===",
+		zap.String("tunnel_id", tunnelID),
+		zap.Int("total_bytes", totalBytes))
+}
+
+func (c *Client) handlePing() {
+	msg := models.Message{
+		Type: models.MsgTypePong,
+	}
+	c.sendMessage(msg)
 }
 
 func (c *Client) heartbeat() {
@@ -402,7 +643,6 @@ func (c *Client) heartbeat() {
 				Payload: hb,
 			}
 
-			c.logger.Debug("Sending heartbeat")
 			if err := c.sendMessage(msg); err != nil {
 				c.logger.Error("Failed to send heartbeat", zap.Error(err))
 				c.reconnect()
@@ -412,568 +652,132 @@ func (c *Client) heartbeat() {
 	}
 }
 
-func (c *Client) handleTextMessage(data []byte) {
-	// 记录原始消息
-	c.logger.Info("=== RAW WEBSOCKET MESSAGE RECEIVED ===",
-		zap.Int("data_length", len(data)),
-		zap.String("raw_data_preview", string(data[:min(500, len(data))])),
-		zap.Time("received_at", time.Now()))
-
-	// 尝试解析为通用map查看结构
-	var rawMsg map[string]interface{}
-	if err := json.Unmarshal(data, &rawMsg); err != nil {
-		c.logger.Error("Failed to parse as generic map",
-			zap.Error(err),
-			zap.String("raw_preview", string(data[:min(200, len(data))])))
-	} else {
-		// 检查type字段
-		if msgType, ok := rawMsg["type"].(string); ok {
-			c.logger.Info("Found message type in raw map",
-				zap.String("type", msgType))
-
-			// 特别检查tunnel相关消息
-			if strings.Contains(strings.ToLower(msgType), "tunnel") {
-				c.logger.Warn("TUNNEL-RELATED MESSAGE DETECTED!",
-					zap.String("type", msgType),
-					zap.Any("payload_keys", getMapKeys(rawMsg)))
-			}
-		}
-	}
-
-	// 继续原有解析
-	var msg models.Message
-	if err := json.Unmarshal(data, &msg); err != nil {
-		c.logger.Error("Failed to unmarshal as models.Message",
-			zap.Error(err),
-			zap.ByteString("raw_data_preview", data[:min(200, len(data))]))
-		return
-	}
-
-	c.logger.Info("Parsed as models.Message",
-		zap.String("type", msg.Type),
-		zap.String("id", msg.ID),
-		zap.Any("payload_keys", getMapKeys(msg.Payload)))
-
-	// 处理所有消息类型
-	switch msg.Type {
-	case models.MsgTypeTunnelReq:
-		c.logger.Info("Processing MsgTypeTunnelReq")
-		c.handleTunnelRequest(msg)
-	case "tunnel_req": // 另一个可能的变体
-		c.logger.Info("Processing 'tunnel_req'")
-		c.handleTunnelRequest(msg)
-	case models.MsgTypeData:
-		c.logger.Info("Processing MsgTypeData")
-		c.handleTunnelData(msg)
-	case models.MsgTypePing:
-		c.logger.Info("Processing MsgTypePing")
-		c.handlePing()
-	case "registration_ack":
-		c.logger.Info("Received registration_ack")
-	case "error":
-		c.logger.Error("Received error from server",
-			zap.Any("message", msg.Payload))
-	default:
-		c.logger.Warn("Unknown message type received",
-			zap.String("type", msg.Type),
-			zap.Any("payload", msg.Payload))
-	}
-}
-
-func (c *Client) handleTunnelData(msg models.Message) {
-	// Parse data packet
-	var dataPacket models.DataPacket
-	payload, _ := json.Marshal(msg.Payload)
-	if err := json.Unmarshal(payload, &dataPacket); err != nil {
-		c.logger.Error("Failed to parse data packet",
-			zap.Error(err),
-			zap.Any("payload", msg.Payload))
-		return
-	}
-
-	c.logger.Info("Received tunnel data",
-		zap.String("tunnel_id", dataPacket.TunnelID),
-		zap.Int("data_size", len(dataPacket.Data)),
-		zap.Bool("is_closing", dataPacket.IsClosing))
-
-	// Find the tunnel
-	c.mu.RLock()
-	tunnel, exists := c.tunnels[dataPacket.TunnelID]
-	c.mu.RUnlock()
-
-	if !exists {
-		c.logger.Warn("Received data for unknown tunnel",
-			zap.String("tunnel_id", dataPacket.TunnelID),
-			zap.Any("existing_tunnels", c.getTunnelIDs()))
-		return
-	}
-
-	if dataPacket.IsClosing {
-		// Close tunnel
-		c.mu.Lock()
-		delete(c.tunnels, dataPacket.TunnelID)
-		c.mu.Unlock()
-
-		if tunnel.LocalConn != nil {
-			tunnel.LocalConn.Close()
-		}
-		c.logger.Info("Tunnel closed via data message",
-			zap.String("tunnel_id", dataPacket.TunnelID))
-		return
-	}
-
-	// Write data to local connection
-	if tunnel.LocalConn != nil {
-		c.logger.Debug("Writing data to local connection",
-			zap.String("tunnel_id", dataPacket.TunnelID),
-			zap.Int("bytes_to_write", len(dataPacket.Data)))
-
-		start := time.Now()
-		n, err := tunnel.LocalConn.Write(dataPacket.Data)
-		duration := time.Since(start)
-
-		if err != nil {
-			c.logger.Error("Failed to write to local connection",
-				zap.String("tunnel_id", dataPacket.TunnelID),
-				zap.Error(err),
-				zap.Duration("write_duration", duration))
-
-			// Close tunnel on error
-			c.mu.Lock()
-			delete(c.tunnels, dataPacket.TunnelID)
-			c.mu.Unlock()
-			tunnel.LocalConn.Close()
-		} else {
-			c.logger.Debug("Successfully wrote to local connection",
-				zap.String("tunnel_id", dataPacket.TunnelID),
-				zap.Int("bytes_written", n),
-				zap.Duration("write_duration", duration))
-		}
-	}
-}
-
-func (c *Client) handleTunnelRequest(msg models.Message) {
-	c.logger.Info("=== handleTunnelRequest ENTER ===",
-		zap.Any("message", msg))
-
-	// Parse tunnel request
-	payload, _ := json.Marshal(msg.Payload)
-	var tunnelReq struct {
-		TunnelID   string `json:"tunnel_id"`
-		TargetPort int    `json:"target_port"`
-		LocalAddr  string `json:"local_addr"`
-	}
-
-	if err := json.Unmarshal(payload, &tunnelReq); err != nil {
-		c.logger.Error("Invalid tunnel request",
-			zap.Error(err),
-			zap.Any("payload", msg.Payload))
-		return
-	}
-
-	c.logger.Info("Received tunnel request",
-		zap.String("tunnel_id", tunnelReq.TunnelID),
-		zap.Int("target_port", tunnelReq.TargetPort),
-		zap.String("local_addr", tunnelReq.LocalAddr))
-
-	// Check if port is allowed
-	allowed := false
-	for _, port := range c.config.Services {
-		if port.Port == tunnelReq.TargetPort {
-			allowed = true
-			break
-		}
-	}
-
-	if !allowed {
-		c.logger.Error("Port not allowed",
-			zap.Int("port", tunnelReq.TargetPort),
-			zap.Any("allowed_ports", c.config.Services))
-		return
-	}
-
-	// Create tunnel
-	go c.createTunnel(tunnelReq.TunnelID, tunnelReq.TargetPort)
-}
-
-func (c *Client) createTunnel(tunnelID string, targetPort int) {
-	c.logger.Info("=== createTunnel START ===",
-		zap.String("tunnel_id", tunnelID),
-		zap.Int("target_port", targetPort))
-
-	// Connect to local service
-	localAddr := fmt.Sprintf("127.0.0.1:%d", targetPort)
-
-	// 先测试端口是否可访问
-	c.logger.Info("Testing connection to local service...")
-	testConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
-	if err != nil {
-		c.logger.Error("Local service connection test FAILED",
-			zap.String("tunnel_id", tunnelID),
-			zap.String("local_addr", localAddr),
-			zap.Error(err))
-		return
-	}
-	testConn.Close()
-	c.logger.Info("Local service connection test PASSED")
-
-	// 实际连接
-	c.logger.Info("Establishing tunnel connection...")
-	conn, err := net.DialTimeout("tcp", localAddr, 30*time.Second)
-	if err != nil {
-		c.logger.Error("Failed to connect to local service",
-			zap.String("tunnel_id", tunnelID),
-			zap.String("local_addr", localAddr),
-			zap.Error(err),
-			zap.String("error_type", fmt.Sprintf("%T", err)))
-		return
-	}
-
-	// 存储隧道
-	tunnel := &Tunnel{
-		ID:         tunnelID,
-		TargetPort: targetPort,
-		LocalConn:  conn,
-	}
-
-	c.mu.Lock()
-	c.tunnels[tunnelID] = tunnel
-	c.mu.Unlock()
-
-	defer func() {
-		c.logger.Info("Closing local connection",
-			zap.String("tunnel_id", tunnelID))
-		conn.Close()
-
-		c.mu.Lock()
-		delete(c.tunnels, tunnelID)
-		c.mu.Unlock()
-	}()
-
-	c.logger.Info("Connected to local service",
-		zap.String("tunnel_id", tunnelID),
-		zap.String("local_addr", localAddr),
-		zap.String("connection_info", fmt.Sprintf("%v", conn)))
-
-	// 设置长超时
-	conn.SetDeadline(time.Time{})
-
-	// Handle bidirectional data transfer
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-
-	// Local -> WebSocket
-	go func() {
-		defer wg.Done()
-		c.forwardLocalToWebSocket(tunnelID, conn)
-	}()
-
-	// WebSocket -> Local (handled by handleBinaryMessage)
-	go func() {
-		defer wg.Done()
-		c.forwardWebSocketToLocal(tunnelID, conn)
-	}()
-
-	wg.Wait()
-
-	c.logger.Info("=== createTunnel END ===",
-		zap.String("tunnel_id", tunnelID))
-}
-
-func (c *Client) forwardLocalToWebSocket(tunnelID string, conn net.Conn) {
-	c.logger.Info("=== forwardLocalToWebSocket START ===",
-		zap.String("tunnel_id", tunnelID),
-		zap.String("local_addr", conn.LocalAddr().String()),
-		zap.String("remote_addr", conn.RemoteAddr().String()))
-
-	buffer := make([]byte, 32*1024) // 32KB buffer
-	totalBytes := 0
-
-	for {
-		c.logger.Debug("Waiting to read from local connection",
-			zap.String("tunnel_id", tunnelID))
-
-		n, err := conn.Read(buffer)
-		if err != nil {
-			if err != io.EOF {
-				c.logger.Error("Local connection read error",
-					zap.String("tunnel_id", tunnelID),
-					zap.Error(err))
-			} else {
-				c.logger.Info("Local connection EOF (end of response)",
-					zap.String("tunnel_id", tunnelID),
-					zap.Int("total_bytes_read", totalBytes))
-			}
-			break
-		}
-
-		if n == 0 {
-			continue
-		}
-
-		totalBytes += n
-		c.logger.Info("Read data from local service",
-			zap.String("tunnel_id", tunnelID),
-			zap.Int("bytes", n),
-			zap.Int("total_bytes", totalBytes),
-			zap.ByteString("data_preview", buffer[:min(100, n)]))
-
-		// Create data packet
-		dataPacket := models.DataPacket{
-			TunnelID: tunnelID,
-			Data:     buffer[:n],
-		}
-
-		msg := models.Message{
-			Type:    models.MsgTypeData,
-			Payload: dataPacket,
-		}
-
-		c.logger.Info("Sending data to control server",
-			zap.String("tunnel_id", tunnelID),
-			zap.Int("data_size", n))
-
-		sendStart := time.Now()
-		if err := c.sendMessage(msg); err != nil {
-			c.logger.Error("Failed to send data to server",
-				zap.String("tunnel_id", tunnelID),
-				zap.Error(err),
-				zap.Duration("duration", time.Since(sendStart)))
-			break
-		}
-
-		c.logger.Info("Data sent successfully",
-			zap.String("tunnel_id", tunnelID),
-			zap.Int("bytes_sent", n),
-			zap.Duration("duration", time.Since(sendStart)))
-	}
-
-	// Send close message
-	dataPacket := models.DataPacket{
-		TunnelID:  tunnelID,
-		IsClosing: true,
-	}
-
-	msg := models.Message{
-		Type:    models.MsgTypeData,
-		Payload: dataPacket,
-	}
-
-	c.logger.Info("Sending tunnel close message",
-		zap.String("tunnel_id", tunnelID))
-
-	c.sendMessage(msg)
-
-	c.logger.Info("=== forwardLocalToWebSocket END ===",
-		zap.String("tunnel_id", tunnelID),
-		zap.Int("total_bytes_forwarded", totalBytes))
-}
-
-func (c *Client) forwardWebSocketToLocal(tunnelID string, conn net.Conn) {
-	c.logger.Info("=== forwardWebSocketToLocal START ===",
-		zap.String("tunnel_id", tunnelID))
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			c.logger.Info("forwardWebSocketToLocal: context cancelled",
-				zap.String("tunnel_id", tunnelID))
-			return
-		case <-ticker.C:
-			// Check if tunnel still exists
-			c.mu.RLock()
-			_, exists := c.tunnels[tunnelID]
-			c.mu.RUnlock()
-
-			if !exists {
-				c.logger.Info("forwardWebSocketToLocal: tunnel no longer exists",
-					zap.String("tunnel_id", tunnelID))
-				return
-			}
-		}
-	}
-}
-
-func (c *Client) handleBinaryMessage(data []byte) {
-	c.logger.Info("=== handleBinaryMessage ===",
-		zap.Int("data_length", len(data)))
-
-	// Binary messages are tunnel data
-	if len(data) < 36 {
-		c.logger.Warn("Binary data too short",
-			zap.Int("length", len(data)))
-		return
-	}
-
-	tunnelID := string(data[:36])
-	tunnelData := data[36:]
-
-	c.logger.Info("Processing binary tunnel data",
-		zap.String("tunnel_id", tunnelID),
-		zap.Int("data_length", len(tunnelData)))
-
-	c.mu.RLock()
-	tunnel, exists := c.tunnels[tunnelID]
-	c.mu.RUnlock()
-
-	if !exists {
-		c.logger.Warn("Received binary data for unknown tunnel",
-			zap.String("tunnel_id", tunnelID))
-		return
-	}
-
-	if tunnel.LocalConn == nil {
-		c.logger.Error("Tunnel local connection is nil",
-			zap.String("tunnel_id", tunnelID))
-		return
-	}
-
-	c.logger.Debug("Writing binary data to local connection",
-		zap.String("tunnel_id", tunnelID),
-		zap.Int("bytes_to_write", len(tunnelData)))
-
-	start := time.Now()
-	n, err := tunnel.LocalConn.Write(tunnelData)
-	duration := time.Since(start)
-
-	if err != nil {
-		c.logger.Error("Failed to write binary data to local connection",
-			zap.String("tunnel_id", tunnelID),
-			zap.Error(err),
-			zap.Duration("write_duration", duration))
-
-		// Close tunnel on error
-		c.mu.Lock()
-		delete(c.tunnels, tunnelID)
-		c.mu.Unlock()
-		tunnel.LocalConn.Close()
-	} else {
-		c.logger.Debug("Successfully wrote binary data",
-			zap.String("tunnel_id", tunnelID),
-			zap.Int("bytes_written", n),
-			zap.Duration("write_duration", duration))
-	}
-}
-
-func (c *Client) handlePing() {
-	c.logger.Debug("Received ping, sending pong")
-
-	msg := models.Message{
-		Type: models.MsgTypePong,
-	}
-
-	c.sendMessage(msg)
-}
-
 func (c *Client) sendMessage(msg models.Message) error {
-	c.logger.Info("=== sendMessage ENTER ===",
-		zap.String("msg_type", msg.Type),
-		zap.String("tunnel_id", msg.ID),
-		zap.Time("timestamp", time.Now()))
-
 	c.mu.RLock()
 	conn := c.wsConn
 	c.mu.RUnlock()
 
 	if conn == nil {
-		c.logger.Error("=== sendMessage FAIL: no WebSocket connection ===")
 		return fmt.Errorf("not connected")
 	}
 
 	data, err := json.Marshal(msg)
 	if err != nil {
-		c.logger.Error("=== sendMessage FAIL: marshal error ===",
-			zap.Error(err))
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	c.logger.Debug("Message prepared",
-		zap.Int("data_len", len(data)),
-		zap.String("data_preview", string(data[:min(200, len(data))])))
-
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	start := time.Now()
-	err = conn.WriteMessage(websocket.TextMessage, data)
-
-	if err != nil {
-		c.logger.Error("=== sendMessage FAIL: write error ===",
-			zap.Error(err),
-			zap.Duration("duration", time.Since(start)))
-		return err
-	}
-
-	c.logger.Info("=== sendMessage SUCCESS ===",
-		zap.String("msg_type", msg.Type),
-		zap.Int("bytes_sent", len(data)),
-		zap.Duration("duration", time.Since(start)))
-
-	return nil
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 func (c *Client) isConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.connected && c.wsConn != nil
+}
 
-	connected := c.connected && c.wsConn != nil
+// 修改closeTunnel，只有在真正需要时才删除隧道
+func (c *Client) closeTunnel(tunnelID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	if !connected {
-		c.logger.Debug("isConnected: false",
-			zap.Bool("c.connected", c.connected),
-			zap.Bool("c.wsConn_nil", c.wsConn == nil))
+	if tunnel, exists := c.tunnels[tunnelID]; exists {
+		tunnel.mu.Lock()
+		if tunnel.LocalConn != nil {
+			tunnel.LocalConn.Close()
+			tunnel.LocalConn = nil
+		}
+		tunnel.Closed = true
+		tunnel.forwarding = false
+		tunnel.mu.Unlock()
+
+		// 关键：不立即删除隧道，让它自然清理
+		// 我们将在后续的清理过程中删除它
+		c.logger.Info("Tunnel marked as closed",
+			zap.String("tunnel_id", tunnelID))
 	}
+}
 
-	return connected
+// 添加清理已关闭隧道的函数
+func (c *Client) cleanupClosedTunnels() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for tunnelID, tunnel := range c.tunnels {
+		tunnel.mu.RLock()
+		closed := tunnel.Closed
+		tunnel.mu.RUnlock()
+
+		if closed {
+			// 检查隧道是否已经空闲一段时间
+			delete(c.tunnels, tunnelID)
+			c.logger.Debug("Removed closed tunnel",
+				zap.String("tunnel_id", tunnelID))
+		}
+	}
 }
 
 func (c *Client) Disconnect() {
 	c.logger.Info("=== Disconnecting client ===")
-
 	c.cancel()
+	c.disconnect()
+}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.connected = false
-
-	if c.wsConn != nil {
-		c.wsConn.Close()
-		c.wsConn = nil
+// 辅助函数
+func isNetError(err error) bool {
+	if err == nil {
+		return false
 	}
 
-	for _, tunnel := range c.tunnels {
-		if tunnel.LocalConn != nil {
-			tunnel.LocalConn.Close()
+	errStr := err.Error()
+	netErrors := []string{
+		"use of closed network connection",
+		"connection reset by peer",
+		"broken pipe",
+		"connection refused",
+		"network is unreachable",
+		"i/o timeout",
+		"websocket: close",
+	}
+
+	for _, netErr := range netErrors {
+		if strings.Contains(strings.ToLower(errStr), strings.ToLower(netErr)) {
+			return true
 		}
 	}
-	c.tunnels = make(map[string]*Tunnel)
 
-	c.logger.Info("Client disconnected")
+	return false
 }
 
-// Helper functions
-func min(a, b int) int {
-	if a < b {
-		return a
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
 	}
-	return b
-}
 
-func getMapKeys(m interface{}) []string {
-	switch v := m.(type) {
-	case map[string]interface{}:
-		keys := make([]string, 0, len(v))
-		for k := range v {
-			keys = append(keys, k)
-		}
-		return keys
-	default:
-		return []string{fmt.Sprintf("%T", m)}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
 	}
+
+	return false
 }
 
+// 检查连接是否已关闭
+func isConnectionClosed(conn net.Conn) bool {
+	if conn == nil {
+		return true
+	}
+
+	// 尝试读取一个字节来检查连接状态
+	conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	var buf [1]byte
+	_, err := conn.Read(buf[:])
+	if err != nil {
+		return true
+	}
+	return false
+}
+
+// 辅助函数：获取所有隧道ID
 func (c *Client) getTunnelIDs() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -983,25 +787,6 @@ func (c *Client) getTunnelIDs() []string {
 		ids = append(ids, id)
 	}
 	return ids
-}
-
-func isTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check for net.Error timeout
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		return true
-	}
-
-	// Check for timeout in error string
-	if strings.Contains(strings.ToLower(err.Error()), "timeout") ||
-		strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") {
-		return true
-	}
-
-	return false
 }
 
 // Utility functions
@@ -1035,13 +820,9 @@ func getOSInfo() string {
 }
 
 func getCPUUsage() float64 {
-	// Simplified CPU usage calculation
-	// In production, use proper metrics collection
 	return 0.0
 }
 
 func getMemoryUsage() float64 {
-	// Simplified memory usage calculation
-	// In production, use proper metrics collection
 	return 0.0
 }
